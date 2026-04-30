@@ -2,468 +2,562 @@
 session_start();
 include "../config.php";
 
-// ✅ Check admin login
-if (!isset($_SESSION['admin'])) {
-    header("Location: ../root.php");
+// ✅ Check employee login session
+if (!isset($_SESSION['employee_logged_in'])) {
+    header("Location: login.php");
     exit();
 }
 
-// ==================== DASHBOARD STATS ====================
-$totalStudents = $conn->query("SELECT COUNT(*) as total FROM students")->fetch_assoc()['total'];
-$totalCollected = $conn->query("SELECT SUM(amount) as total FROM payments")->fetch_assoc()['total'] ?? 0;
-$totalFees = $conn->query("SELECT SUM(total_fee) as total FROM students")->fetch_assoc()['total'] ?? 0;
-$totalDue = $totalFees - $totalCollected;
+// ✅ Get employee id
+$emp_id = $_SESSION['employee_id'];
 
-$totalEmployee = $conn->query("SELECT COUNT(*) as total FROM employee")->fetch_assoc()['total'];
-$totalSalary = $conn->query("SELECT SUM(salary) as total FROM employee")->fetch_assoc()['total'] ?? 0;
+// ✅ Fetch employee details
+$emp_query = $conn->query("SELECT * FROM employee WHERE emp_id = '$emp_id'");
+$emp = $emp_query->fetch_assoc();
+$employee_department = $emp['department'];
 
-// ==================== HOD STATS ====================
-$totalHOD = $conn->query("SELECT COUNT(*) as total FROM hod")->fetch_assoc()['total'];
+// ✅ Fetch HOD assigned subjects for this employee
+$assigned_subjects = $conn->query("
+    SELECT es.*, s.subject_name, s.semester 
+    FROM employee_subjects es
+    JOIN subjects s ON es.subject_code = s.subject_code
+    WHERE es.employee_id = '$emp_id' AND es.department = '$employee_department'
+    ORDER BY s.semester, es.section
+");
 
-// ==================== FETCH ALL DATA ====================
-$students = $conn->query("SELECT * FROM students ORDER BY roll_no ASC");
-$employees = $conn->query("SELECT * FROM employee ORDER BY emp_id ASC");
-$hods = $conn->query("SELECT * FROM hod ORDER BY department ASC");
+// ✅ Fetch HOD assigned timetable for this employee
+$employee_timetable = $conn->query("
+    SELECT t.*, s.subject_name, 
+           CASE 
+               WHEN t.day_of_week = 'Monday' THEN 1
+               WHEN t.day_of_week = 'Tuesday' THEN 2
+               WHEN t.day_of_week = 'Wednesday' THEN 3
+               WHEN t.day_of_week = 'Thursday' THEN 4
+               WHEN t.day_of_week = 'Friday' THEN 5
+               WHEN t.day_of_week = 'Saturday' THEN 6
+               ELSE 7
+           END as day_order
+    FROM timetable t
+    JOIN subjects s ON t.subject_code = s.subject_code
+    WHERE t.employee_id = '$emp_id' AND t.department = '$employee_department'
+    ORDER BY day_order, t.period
+");
 
-// ==================== HANDLE DELETIONS ====================
-if(isset($_GET['delete_student'])){
-    $id = intval($_GET['delete_student']);
-    
-    // First delete related records to avoid foreign key constraints
-    $conn->query("DELETE FROM payments WHERE student_id=$id");
-    $conn->query("DELETE FROM attendance WHERE student_id=$id");
-    $conn->query("DELETE FROM internal_marks WHERE student_id=$id");
-    
-    // Then delete the student using correct column name 'id'
-    if($conn->query("DELETE FROM students WHERE id=$id")){
-        header("Location: dashboard.php?msg=student_deleted");
-    } else {
-        header("Location: dashboard.php?msg=student_delete_error");
-    }
-    exit();
+// ✅ Get unique sections for this employee
+$sections = $conn->query("
+    SELECT DISTINCT section FROM employee_subjects 
+    WHERE employee_id = '$emp_id' AND department = '$employee_department'
+    ORDER BY section
+");
+
+// ✅ Dashboard statistics
+$students_query = $conn->query("SELECT COUNT(*) AS total_students FROM students WHERE department = '$employee_department'");
+$students = $students_query->fetch_assoc()['total_students'];
+
+// ✅ ==================== ATTENDANCE MARKING ====================
+$show_students = false;
+$attendance_saved = false;
+$already_marked = false;
+$present = 0;
+$absent = 0;
+$attendance_error = "";
+$students_list = null;
+
+// Check session for attendance data
+if(isset($_SESSION['attendance_subject']) && isset($_SESSION['attendance_section']) && isset($_SESSION['attendance_date'])) {
+    $show_students = true;
+    $students_list = $conn->query("SELECT * FROM students WHERE department='$employee_department' AND section='{$_SESSION['attendance_section']}' ORDER BY roll_no");
 }
 
-if(isset($_GET['delete_employee'])){
-    $emp_id = $conn->real_escape_string($_GET['delete_employee']);
-    
-    // Delete related records if any
-    $conn->query("DELETE FROM employee_subjects WHERE employee_id='$emp_id'");
-    $conn->query("DELETE FROM timetable WHERE employee_id='$emp_id'");
-    
-    // Delete employee
-    if($conn->query("DELETE FROM employee WHERE emp_id='$emp_id'")){
-        header("Location: dashboard.php?msg=employee_deleted");
-    } else {
-        header("Location: dashboard.php?msg=employee_delete_error");
-    }
-    exit();
-}
-
-if(isset($_GET['delete_hod'])){
-    $hod_id = intval($_GET['delete_hod']);
-    
-    // Delete HOD
-    if($conn->query("DELETE FROM hod WHERE id=$hod_id")){
-        header("Location: dashboard.php?msg=hod_deleted");
-    } else {
-        header("Location: dashboard.php?msg=hod_delete_error");
-    }
-    exit();
-}
-
-// ==================== HANDLE ADD/EDIT OPERATIONS ====================
-
-// Add Student (with section)
-if(isset($_POST['add_student'])){
-    $roll_no = trim($_POST['roll_no']);
-    $name = trim($_POST['name']);
-    $dob = $_POST['dob'];
-    $email = $_POST['email'];
-    $password = password_hash($_POST['password'], PASSWORD_DEFAULT);
-    $total_fee = $_POST['total_fee'];
-    $course = $_POST['course'];
-    $department = $_POST['department'];
-    $semester = $_POST['semester'];
+// Load students for attendance
+if(isset($_POST['load_attendance_students'])){
+    $subject_code = $_POST['subject_code'];
     $section = $_POST['section'];
-    $phone = $_POST['phone'];
-    $ssc_marks = $_POST['ssc_marks'];
-    $polycet_rank = $_POST['polycet_rank'];
-    $category = $_POST['category'];
-    $father_name = $_POST['father_name'];
-    $mother_name = $_POST['mother_name'];
-    $blood_group = $_POST['blood_group'];
-    $permanent_address = $_POST['permanent_address'];
-    $local_address = $_POST['local_address'];
+    $date = $_POST['attendance_date'];
     
+    // Verify if employee is assigned to this subject
+    $check_assigned = $conn->query("SELECT * FROM employee_subjects 
+                                    WHERE employee_id = '$emp_id' 
+                                    AND subject_code = '$subject_code' 
+                                    AND section = '$section'");
     
-    $photo_name = "";
-    if(isset($_FILES['photo']) && $_FILES['photo']['error'] == 0){
-        $target_dir = "../uploads/";
-        if(!is_dir($target_dir)) mkdir($target_dir, 0777, true);
-        $photo_name = time() . "_" . basename($_FILES["photo"]["name"]);
-        move_uploaded_file($_FILES["photo"]["tmp_name"], $target_dir . $photo_name);
+    if($check_assigned->num_rows > 0) {
+        // Check if there are students in this section
+        $student_check = $conn->query("SELECT COUNT(*) as count FROM students WHERE department='$employee_department' AND section='$section'");
+        $student_count = $student_check->fetch_assoc()['count'];
+        
+        if($student_count > 0) {
+            $_SESSION['attendance_subject'] = $subject_code;
+            $_SESSION['attendance_section'] = $section;
+            $_SESSION['attendance_date'] = $date;
+            
+            // Refresh the page to show the attendance form
+            header("Location: ".$_SERVER['PHP_SELF']);
+            exit();
+        } else {
+            $attendance_error = "No students found in this section!";
+        }
+    } else {
+        $attendance_error = "You are not assigned to this subject/section!";
     }
-    
-    $stmt = $conn->prepare("INSERT INTO students (roll_no, name, dob, email, password, total_fee, course, department, semester, section, phone, ssc_marks, polycet_rank, category, father_name, mother_name, blood_group, permanent_address, local_address, photo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    $stmt->bind_param("ssssssssssississssss", $roll_no, $name, $dob, $email, $password, $total_fee, $course, $department, $semester, $section, $phone, $ssc_marks, $polycet_rank, $category, $father_name, $mother_name, $blood_group, $permanent_address, $local_address, $photo_name);
-    $stmt->execute();
-    $student_success = "Student added successfully!";
 }
 
-// Edit Student
-if(isset($_POST['edit_student'])){
-    $id = $_POST['student_id'];
-    $roll_no = trim($_POST['roll_no']);
-    $name = trim($_POST['name']);
-    $dob = $_POST['dob'];
-    $email = $_POST['email'];
-    $total_fee = $_POST['total_fee'];
-    $course = $_POST['course'];
-    $department = $_POST['department'];
-    $semester = $_POST['semester'];
+// Submit attendance
+if(isset($_POST['submit_attendance'])){
+    $subject_code = $_POST['subject_code'];
     $section = $_POST['section'];
-    $phone = $_POST['phone'];
-    $ssc_marks = $_POST['ssc_marks'];
-    $polycet_rank = $_POST['polycet_rank'];
-    $category = $_POST['category'];
-    $father_name = $_POST['father_name'];
-    $mother_name = $_POST['mother_name'];
-    $blood_group = $_POST['blood_group'];
-    $permanent_address = $_POST['permanent_address'];
-    $local_address = $_POST['local_address'];
+    $date = $_POST['attendance_date'];
     
-    $photo_name = $_POST['old_photo'];
-    if(isset($_FILES['photo']) && $_FILES['photo']['error'] == 0){
-        $target_dir = "../uploads/";
-        $photo_name = time() . "_" . basename($_FILES["photo"]["name"]);
-        move_uploaded_file($_FILES["photo"]["tmp_name"], $target_dir . $photo_name);
+    // Check if attendance already marked for this date
+    $check = $conn->prepare("SELECT id FROM attendance 
+        WHERE student_id=? AND subject_code=? AND attendance_date=?");
+    
+    $attendance_marked = false;
+    $marked_count = 0;
+    
+    if(isset($_POST['attendance']) && is_array($_POST['attendance'])){
+        foreach($_POST['attendance'] as $student_id => $status){
+            $check->bind_param("iss", $student_id, $subject_code, $date);
+            $check->execute();
+            $check->store_result();
+            
+            if($check->num_rows > 0){
+                $attendance_marked = true;
+                $marked_count++;
+            }
+        }
+        
+        if($attendance_marked){
+            $already_marked = true;
+            $attendance_error = "$marked_count students already have attendance marked for this date!";
+        } else {
+            foreach($_POST['attendance'] as $student_id => $status){
+                if($status=="Present") $present++;
+                else $absent++;
+
+                $stmt = $conn->prepare("INSERT INTO attendance
+                (student_id, subject_code, section, attendance_date, status)
+                VALUES (?, ?, ?, ?, ?)");
+                $stmt->bind_param("issss", $student_id, $subject_code, $section, $date, $status);
+                $stmt->execute();
+            }
+            $attendance_saved = true;
+            
+            // Clear session
+            unset($_SESSION['attendance_subject']);
+            unset($_SESSION['attendance_section']);
+            unset($_SESSION['attendance_date']);
+            
+            // Redirect with success message
+            header("Location: ".$_SERVER['PHP_SELF']."?attendance_success=1&present=$present&absent=$absent");
+            exit();
+        }
     }
-    
-    $stmt = $conn->prepare("UPDATE students SET roll_no=?, name=?, dob=?, email=?, total_fee=?, course=?, department=?, semester=?, section=?, phone=?, ssc_marks=?, polycet_rank=?, category=?, father_name=?, mother_name=?, blood_group=?, permanent_address=?, local_address=?, photo=? WHERE id=?");
-    $stmt->bind_param("ssssssssssiisssssssi", $roll_no, $name, $dob, $email, $total_fee, $course, $department, $semester, $section, $phone, $ssc_marks, $polycet_rank, $category, $father_name, $mother_name, $blood_group, $permanent_address, $local_address, $photo_name, $id);
-    $stmt->execute();
-    $student_update_success = "Student updated successfully!";
 }
 
-// Add Employee
-if(isset($_POST['add_employee'])){
-    $empid = $_POST['empid'];
-    $name = $_POST['name'];
-    $dob = $_POST['dob'];
-    $department = $_POST['department'];
-    $phone = $_POST['phone'];
-    $category = $_POST['category'];
-    $father = $_POST['father_name'];
-    $blood = $_POST['blood_group'];
-    $address = $_POST['permanent_address'];
-    $prof = $_POST['profession'];
-    $sal = intval($_POST['salary']);
-    $email = $_POST['email'];
-    $user = $_POST['username'];
-    $pass = $_POST['password'];
+// ✅ ==================== INTERNAL MARKS WITH COMPONENTS ====================
+$marks_success = "";
+$marks_error = "";
+$show_marks_students = false;
+$marks_students_list = null;
+
+// Check session for marks data
+if(isset($_SESSION['marks_subject']) && isset($_SESSION['marks_section']) && isset($_SESSION['marks_exam_type'])) {
+    $show_marks_students = true;
+    $marks_students_list = $conn->query("SELECT * FROM students WHERE department='$employee_department' AND section='{$_SESSION['marks_section']}' ORDER BY roll_no");
+}
+
+// Load students for marks
+if(isset($_POST['load_marks_students'])){
+    $subject_code = $_POST['subject_code'];
+    $section = $_POST['section'];
+    $exam_type = $_POST['exam_type'];
     
-    $photoName = "";
-    if(!empty($_FILES['photo']['name'])){
-        $photoName = time() . "_" . $_FILES['photo']['name'];
-        move_uploaded_file($_FILES['photo']['tmp_name'], "../uploads/" . $photoName);
+    // Verify if employee is assigned to this subject
+    $check_assigned = $conn->query("SELECT * FROM employee_subjects 
+                                    WHERE employee_id = '$emp_id' 
+                                    AND subject_code = '$subject_code' 
+                                    AND section = '$section'");
+    
+    if($check_assigned->num_rows > 0) {
+        // Check if there are students in this section
+        $student_check = $conn->query("SELECT COUNT(*) as count FROM students WHERE department='$employee_department' AND section='$section'");
+        $student_count = $student_check->fetch_assoc()['count'];
+        
+        if($student_count > 0) {
+            $_SESSION['marks_subject'] = $subject_code;
+            $_SESSION['marks_section'] = $section;
+            $_SESSION['marks_exam_type'] = $exam_type;
+            
+            // Refresh the page to show the marks entry form
+            header("Location: ".$_SERVER['PHP_SELF']);
+            exit();
+        } else {
+            $marks_error = "No students found in this section!";
+        }
+    } else {
+        $marks_error = "You are not assigned to this subject/section!";
     }
-    
-    $stmt = $conn->prepare("INSERT INTO employee (emp_id, name, dob, department, phone, category, father_name, blood_group, permanent_address, profession, salary, email, username, password, photo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    $stmt->bind_param("ssssssssssissss", $empid, $name, $dob, $department, $phone, $category, $father, $blood, $address, $prof, $sal, $email, $user, $pass, $photoName);
-    $stmt->execute();
-    $employee_success = "Employee added successfully!";
 }
 
-// Edit Employee
-if(isset($_POST['edit_employee'])){
-    $empid = $_POST['emp_id'];
-    $name = $_POST['name'];
-    $dob = $_POST['dob'];
-    $department = $_POST['department'];
-    $phone = $_POST['phone'];
-    $category = $_POST['category'];
-    $father = $_POST['father_name'];
-    $blood = $_POST['blood_group'];
-    $address = $_POST['permanent_address'];
-    $prof = $_POST['profession'];
-    $sal = intval($_POST['salary']);
-    $email = $_POST['email'];
-    $user = $_POST['username'];
-    
-    $photoName = $_POST['old_photo'];
-    if(!empty($_FILES['photo']['name'])){
-        $photoName = time() . "_" . $_FILES['photo']['name'];
-        move_uploaded_file($_FILES['photo']['tmp_name'], "../uploads/" . $photoName);
+// Save marks with components
+if(isset($_POST['save_marks_components'])){
+    $subject_code = $_POST['subject_code'];
+    $section = $_POST['section'];
+    $exam_type = $_POST['exam_type'];
+
+    if(isset($_POST['written']) && is_array($_POST['written'])){
+        $success_count = 0;
+        foreach($_POST['written'] as $student_id => $written){
+            $assignment = isset($_POST['assignment'][$student_id]) ? $_POST['assignment'][$student_id] : 0;
+            $dinamic = isset($_POST['dinamic'][$student_id]) ? $_POST['dinamic'][$student_id] : 0;
+            $total = $written + $assignment + $dinamic;
+            
+            // Ensure totals don't exceed limits
+            if($written > 40) $written = 40;
+            if($assignment > 5) $assignment = 5;
+            if($dinamic > 5) $dinamic = 5;
+            if($total > 50) $total = 50;
+            
+            $stmt = $conn->prepare("INSERT INTO internal_marks 
+                (student_id, subject_code, section, exam_type, marks, assignment_marks, dinamic_marks)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE 
+                marks=?, assignment_marks=?, dinamic_marks=?");
+            
+            $stmt->bind_param("isssiiiiii", 
+                $student_id, $subject_code, $section, $exam_type, $total, 
+                $assignment, $dinamic,
+                $total, $assignment, $dinamic);
+                
+            if($stmt->execute()){
+                $success_count++;
+            } else {
+                $marks_error = "Error: " . $stmt->error;
+            }
+        }
+        if($success_count > 0){
+            // Clear session
+            unset($_SESSION['marks_subject']);
+            unset($_SESSION['marks_section']);
+            unset($_SESSION['marks_exam_type']);
+            
+            // Redirect with success message
+            header("Location: ".$_SERVER['PHP_SELF']."?success=marks");
+            exit();
+        }
     }
-    
-    $stmt = $conn->prepare("UPDATE employee SET name=?, dob=?, department=?, phone=?, category=?, father_name=?, blood_group=?, permanent_address=?, profession=?, salary=?, email=?, username=?, photo=? WHERE emp_id=?");
-    $stmt->bind_param("ssssssssssssss", $name, $dob, $department, $phone, $category, $father, $blood, $address, $prof, $sal, $email, $user, $photoName, $empid);
-    $stmt->execute();
-    $employee_update_success = "Employee updated successfully!";
 }
 
-// Add HOD
-if(isset($_POST['add_hod'])){
-    $hod_id = $_POST['hod_id'];
-    $name = $_POST['name'];
-    $email = $_POST['email'];
-    $phone = $_POST['phone'];
-    $department = $_POST['department'];
-    $qualification = $_POST['qualification'];
-    $experience = $_POST['experience'];
-    $username = $_POST['username'];
-    $password = $_POST['password'];
-    
-    $photoName = "";
-    if(!empty($_FILES['photo']['name'])){
-        $photoName = time() . "_" . $_FILES['photo']['name'];
-        move_uploaded_file($_FILES['photo']['tmp_name'], "../uploads/" . $photoName);
+// ✅ ==================== FEE COLLECTION ====================
+$fee_error = "";
+$fee_success = false;
+$receipt_data = null;
+$selected_student = null;
+$show_fee_form = false;
+
+// Check session for fee collection
+if(isset($_SESSION['fee_student_id'])) {
+    $show_fee_form = true;
+    $student_id = $_SESSION['fee_student_id'];
+    $student_query = $conn->query("SELECT * FROM students WHERE id='$student_id' AND department='$employee_department'");
+    if($student_query->num_rows > 0) {
+        $selected_student = $student_query->fetch_assoc();
+        
+        $paid_query = $conn->query("SELECT SUM(amount) as total_paid FROM payments WHERE student_id='$student_id'");
+        $paid_data = $paid_query->fetch_assoc();
+        $total_paid = $paid_data['total_paid'] ?? 0;
+        $old_balance = $selected_student['total_fee'] - $total_paid;
     }
-    
-    $stmt = $conn->prepare("INSERT INTO hod (hod_id, name, email, phone, department, qualification, experience, username, password, photo) VALUES (?,?,?,?,?,?,?,?,?,?)");
-    $stmt->bind_param("ssssssisss", $hod_id, $name, $email, $phone, $department, $qualification, $experience, $username, $password, $photoName);
-    $stmt->execute();
-    $hod_success = "HOD added successfully!";
 }
 
-// Edit HOD
-if(isset($_POST['edit_hod'])){
-    $id = $_POST['hod_id'];
-    $hod_id = $_POST['hod_id_code'];
-    $name = $_POST['name'];
-    $email = $_POST['email'];
-    $phone = $_POST['phone'];
-    $department = $_POST['department'];
-    $qualification = $_POST['qualification'];
-    $experience = $_POST['experience'];
-    $username = $_POST['username'];
+// Load student for fee collection
+if(isset($_POST['load_fee_student'])){
+    $student_id = $_POST['student_id'];
     
-    $photoName = $_POST['old_photo'];
-    if(!empty($_FILES['photo']['name'])){
-        $photoName = time() . "_" . $_FILES['photo']['name'];
-        move_uploaded_file($_FILES['photo']['tmp_name'], "../uploads/" . $photoName);
+    // Verify student belongs to this department
+    $check_student = $conn->query("SELECT * FROM students WHERE id='$student_id' AND department='$employee_department'");
+    
+    if($check_student->num_rows > 0) {
+        $_SESSION['fee_student_id'] = $student_id;
+        
+        // Refresh the page to show the fee collection form
+        header("Location: ".$_SERVER['PHP_SELF']);
+        exit();
+    } else {
+        $fee_error = "Student not found in your department!";
     }
+}
+
+// Collect fee
+if(isset($_POST['collect_fee'])){
+    $student_id = $_POST['student_id'];
+    $amount = intval($_POST['amount']);
     
-    $stmt = $conn->prepare("UPDATE hod SET hod_id=?, name=?, email=?, phone=?, department=?, qualification=?, experience=?, username=?, photo=? WHERE id=?");
-    $stmt->bind_param("ssssssissi", $hod_id, $name, $email, $phone, $department, $qualification, $experience, $username, $photoName, $id);
-    $stmt->execute();
-    $hod_update_success = "HOD updated successfully!";
+    // Verify student belongs to this department
+    $student_query = $conn->query("SELECT * FROM students WHERE id='$student_id' AND department='$employee_department'");
+    
+    if($student_query->num_rows > 0) {
+        $student = $student_query->fetch_assoc();
+        
+        $paid_query = $conn->query("SELECT SUM(amount) as total_paid FROM payments WHERE student_id='$student_id'");
+        $paid_data = $paid_query->fetch_assoc();
+        $total_paid = $paid_data['total_paid'] ?? 0;
+        $old_balance = $student['total_fee'] - $total_paid;
+
+        if($amount > 0 && $amount <= $old_balance){
+            $conn->query("INSERT INTO payments (student_id, amount, pay_date) VALUES ('$student_id', '$amount', NOW())");
+            $new_balance = $old_balance - $amount;
+            
+            $receipt_data = [
+                "receipt_no" => rand(10000,99999),
+                "student_name" => $student['name'],
+                "student_id" => $student_id,
+                "old_balance" => $old_balance,
+                "amount" => $amount,
+                "new_balance" => $new_balance,
+                "date" => date("Y-m-d H:i:s")
+            ];
+            $fee_success = true;
+            
+            // Clear session after successful payment
+            unset($_SESSION['fee_student_id']);
+        } else {
+            $fee_error = "Invalid amount! Maximum allowed: ₹" . $old_balance;
+        }
+    } else {
+        $fee_error = "Student not found in your department!";
+    }
 }
 
-// Get single record for editing
-$edit_student = null;
-$edit_employee = null;
-$edit_hod = null;
-
-if(isset($_GET['edit_student_id'])){
-    $id = intval($_GET['edit_student_id']);
-    $result = $conn->query("SELECT * FROM students WHERE id=$id");
-    $edit_student = $result->fetch_assoc();
+// Cancel fee collection
+if(isset($_GET['cancel_fee'])) {
+    unset($_SESSION['fee_student_id']);
+    header("Location: ".$_SERVER['PHP_SELF']);
+    exit();
 }
 
-if(isset($_GET['edit_employee_id'])){
-    $emp_id = $_GET['edit_employee_id'];
-    $result = $conn->query("SELECT * FROM employee WHERE emp_id='$emp_id'");
-    $edit_employee = $result->fetch_assoc();
-}
+// ✅ Student list for fee collection
+$students_list_fee = $conn->query("SELECT * FROM students WHERE department='$employee_department' ORDER BY roll_no ASC");
 
-if(isset($_GET['edit_hod_id'])){
-    $id = intval($_GET['edit_hod_id']);
-    $result = $conn->query("SELECT * FROM hod WHERE id=$id");
-    $edit_hod = $result->fetch_assoc();
-}
+// ✅ Attendance Report Data
+$attendance_report = $conn->query("
+    SELECT s.roll_no, s.name, s.section,
+           COUNT(a.id) as total_classes,
+           SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) as total_present,
+           SUM(CASE WHEN a.status = 'Absent' THEN 1 ELSE 0 END) as total_absent
+    FROM students s
+    LEFT JOIN attendance a ON s.id = a.student_id
+    WHERE s.department = '$employee_department'
+    GROUP BY s.id
+    ORDER BY s.section, s.roll_no
+");
 
-// Get single record for viewing
-$view_student = null;
-$view_employee = null;
-$view_hod = null;
-
-if(isset($_GET['view_student_id'])){
-    $id = intval($_GET['view_student_id']);
-    $result = $conn->query("SELECT * FROM students WHERE id=$id");
-    $view_student = $result->fetch_assoc();
-}
-
-if(isset($_GET['view_employee_id'])){
-    $emp_id = $_GET['view_employee_id'];
-    $result = $conn->query("SELECT * FROM employee WHERE emp_id='$emp_id'");
-    $view_employee = $result->fetch_assoc();
-}
-
-if(isset($_GET['view_hod_id'])){
-    $id = intval($_GET['view_hod_id']);
-    $result = $conn->query("SELECT * FROM hod WHERE id=$id");
-    $view_hod = $result->fetch_assoc();
-}
+// ✅ Monthly Report Data
+$month = date("m");
+$year = date("Y");
+$monthly_report = $conn->query("
+    SELECT s.roll_no, s.name, s.section,
+           COUNT(a.id) as total_classes,
+           SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) as total_present
+    FROM students s
+    LEFT JOIN attendance a ON s.id = a.student_id 
+    AND MONTH(a.attendance_date) = $month
+    AND YEAR(a.attendance_date) = $year
+    WHERE s.department = '$employee_department'
+    GROUP BY s.id
+    ORDER BY s.section, s.roll_no
+");
 ?>
 
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Dashboard | A.A.N.M.&.V.V.R.S.R. POLYTECHNIC</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
+    <title>Employee Dashboard | A.A.N.M.&.V.V.R.S.R. POLYTECHNIC</title>
     
     <!-- Fonts & Icons -->
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@200;300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css">
     
     <style>
+        /* CSS Variables for Light/Dark Theme */
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --secondary: #ec4899;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --dark: #0f172a;
+            --darker: #020617;
+            --light: #f8fafc;
+            --glass-bg: rgba(255, 255, 255, 0.1);
+            --glass-border: rgba(255, 255, 255, 0.2);
+            --shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            --shadow-hover: 0 40px 70px -15px rgba(0, 0, 0, 0.7);
+            --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
-            font-family: 'Plus Jakarta Sans', sans-serif;
         }
 
         body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            background: var(--darker);
             min-height: 100vh;
             position: relative;
-            overflow-x: hidden;
+            color: white;
         }
 
-        /* Animated Background */
-        .bg-orb {
+        /* Ultra Modern Animated Background */
+        #gradient-bg {
             position: fixed;
-            border-radius: 50%;
-            filter: blur(80px);
-            opacity: 0.3;
-            z-index: 0;
-            animation: orbFloat 20s ease-in-out infinite;
-        }
-
-        .orb-1 {
-            width: 500px;
-            height: 500px;
-            background: #ff6b6b;
-            top: -200px;
-            right: -200px;
-        }
-
-        .orb-2 {
-            width: 400px;
-            height: 400px;
-            background: #4facfe;
-            bottom: -150px;
-            left: -150px;
-            animation-delay: -5s;
-        }
-
-        .orb-3 {
-            width: 300px;
-            height: 300px;
-            background: #43e97b;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            animation-delay: -10s;
-        }
-
-        @keyframes orbFloat {
-            0%, 100% { transform: translate(0, 0) scale(1); }
-            33% { transform: translate(50px, -30px) scale(1.1); }
-            66% { transform: translate(-30px, 50px) scale(0.9); }
-        }
-
-        /* Grid Pattern */
-        .grid-pattern {
-            position: fixed;
+            top: 0;
+            left: 0;
             width: 100%;
             height: 100%;
-            background-image: 
-                linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
-            background-size: 50px 50px;
-            z-index: 0;
-            animation: gridMove 20s linear infinite;
+            z-index: -2;
+            background: linear-gradient(-45deg, #4158D0, #C850C0, #FFCC70, #2193b0);
+            background-size: 400% 400%;
+            animation: gradient 15s ease infinite;
         }
 
-        @keyframes gridMove {
-            0% { transform: translate(0, 0); }
-            100% { transform: translate(50px, 50px); }
+        @keyframes gradient {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        /* Noise Texture */
+        .noise {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            opacity: 0.15;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+            pointer-events: none;
+        }
+
+        /* Floating Particles */
+        .particle {
+            position: fixed;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.2);
+            pointer-events: none;
+            z-index: -1;
+            animation: particle-float 20s infinite linear;
+        }
+
+        @keyframes particle-float {
+            from {
+                transform: translateY(100vh) rotate(0deg);
+            }
+            to {
+                transform: translateY(-100px) rotate(720deg);
+            }
         }
 
         /* Main Container */
-        .dashboard {
-            max-width: 1600px;
+        .app {
+            max-width: 1440px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 1.5rem;
             position: relative;
-            z-index: 2;
+            z-index: 1;
         }
 
-        /* Glass Navigation */
+        /* Ultra Modern Glass Navigation */
         .glass-nav {
             background: rgba(255, 255, 255, 0.1);
             backdrop-filter: blur(20px);
             -webkit-backdrop-filter: blur(20px);
             border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 30px;
-            padding: 1.5rem 2rem;
+            padding: 1rem 2rem;
             margin-bottom: 2rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            color: white;
-            animation: slideDown 0.8s ease;
             box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+            animation: slideDown 0.6s ease;
         }
 
-        @keyframes slideDown {
-            from {
-                opacity: 0;
-                transform: translateY(-30px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .admin-info {
+        .logo {
             display: flex;
             align-items: center;
-            gap: 1.5rem;
+            gap: 1rem;
         }
 
-        .admin-avatar {
-            width: 60px;
-            height: 60px;
-            background: linear-gradient(135deg, #ffd93d, #ff6b6b);
-            border-radius: 20px;
+        .logo-icon {
+            width: 45px;
+            height: 45px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 15px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.8rem;
+            font-size: 1.5rem;
             transform: rotate(-5deg);
             transition: transform 0.3s ease;
         }
 
-        .admin-avatar:hover {
+        .logo-icon:hover {
             transform: rotate(0deg) scale(1.1);
         }
 
-        .admin-details h2 {
-            font-size: 1.5rem;
+        .logo-text h1 {
+            font-size: 1.3rem;
             font-weight: 700;
             background: linear-gradient(135deg, #fff, #a5b4fc);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
 
-        .admin-details p {
-            font-size: 0.9rem;
+        .logo-text p {
+            font-size: 0.8rem;
             opacity: 0.8;
+        }
+
+        .nav-actions {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .theme-toggle {
+            width: 45px;
+            height: 45px;
+            background: rgba(255, 255, 255, 0.15);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .theme-toggle:hover {
+            background: rgba(255, 255, 255, 0.25);
+            transform: rotate(45deg);
         }
 
         .logout-btn {
             background: rgba(255, 255, 255, 0.15);
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            border-radius: 50px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 20px;
             padding: 0.7rem 1.5rem;
             color: white;
             text-decoration: none;
+            font-weight: 500;
             transition: all 0.3s ease;
             display: flex;
             align-items: center;
@@ -471,12 +565,94 @@ if(isset($_GET['view_hod_id'])){
         }
 
         .logout-btn:hover {
-            background: #ff4757;
+            background: var(--danger);
             transform: translateY(-3px);
-            box-shadow: 0 10px 25px rgba(255, 71, 87, 0.4);
+            box-shadow: 0 10px 25px rgba(239, 68, 68, 0.4);
         }
 
-        /* Stats Grid */
+        /* Welcome Hero Section */
+        .hero-section {
+            background: linear-gradient(135deg, rgba(99, 102, 241, 0.3), rgba(236, 72, 153, 0.3));
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 40px;
+            padding: 2.5rem;
+            margin-bottom: 2rem;
+            position: relative;
+            overflow: hidden;
+            animation: slideUp 0.7s ease;
+        }
+
+        .hero-content {
+            position: relative;
+            z-index: 2;
+        }
+
+        .greeting {
+            font-size: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+            opacity: 0.8;
+            margin-bottom: 0.5rem;
+        }
+
+        .hero-title {
+            font-size: 3rem;
+            font-weight: 800;
+            line-height: 1.2;
+            margin-bottom: 1rem;
+        }
+
+        .hero-title span {
+            background: linear-gradient(135deg, #ffd700, #ffa500);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .hero-stats {
+            display: flex;
+            gap: 2rem;
+            margin-top: 1.5rem;
+        }
+
+        .hero-stat-item {
+            display: flex;
+            align-items: center;
+            gap: 0.8rem;
+        }
+
+        .hero-stat-icon {
+            width: 45px;
+            height: 45px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.3rem;
+        }
+
+        .hero-stat-info h4 {
+            font-size: 1.3rem;
+            font-weight: 700;
+        }
+
+        .hero-stat-info p {
+            font-size: 0.8rem;
+            opacity: 0.7;
+        }
+
+        .hero-pattern {
+            position: absolute;
+            top: -50%;
+            right: -10%;
+            width: 80%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255, 255, 255, 0.1) 0%, transparent 70%);
+            animation: pulse 8s ease infinite;
+        }
+
+        /* Quick Stats Grid */
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -484,70 +660,72 @@ if(isset($_GET['view_hod_id'])){
             margin-bottom: 2rem;
         }
 
-        .stat-card {
+        .stat-card-modern {
             background: rgba(255, 255, 255, 0.1);
             backdrop-filter: blur(10px);
             border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 30px;
             padding: 1.5rem;
-            color: white;
-            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-            animation: fadeInUp 0.6s ease;
+            transition: all 0.3s ease;
+            animation: fadeInScale 0.5s ease;
             animation-fill-mode: both;
         }
 
-        .stat-card:nth-child(1) { animation-delay: 0.1s; }
-        .stat-card:nth-child(2) { animation-delay: 0.15s; }
-        .stat-card:nth-child(3) { animation-delay: 0.2s; }
-        .stat-card:nth-child(4) { animation-delay: 0.25s; }
-        .stat-card:nth-child(5) { animation-delay: 0.3s; }
-        .stat-card:nth-child(6) { animation-delay: 0.35s; }
-        .stat-card:nth-child(7) { animation-delay: 0.4s; }
+        .stat-card-modern:nth-child(1) { animation-delay: 0.1s; }
+        .stat-card-modern:nth-child(2) { animation-delay: 0.2s; }
+        .stat-card-modern:nth-child(3) { animation-delay: 0.3s; }
 
-        .stat-card:hover {
+        .stat-card-modern:hover {
             transform: translateY(-10px) scale(1.02);
             background: rgba(255, 255, 255, 0.15);
-            box-shadow: 0 30px 60px rgba(0, 0, 0, 0.5);
+            box-shadow: var(--shadow-hover);
         }
 
-        .stat-icon {
-            width: 50px;
-            height: 50px;
-            background: linear-gradient(135deg, #ffd93d, #ff6b6b);
-            border-radius: 15px;
+        .stat-header {
             display: flex;
+            justify-content: space-between;
             align-items: center;
-            justify-content: center;
-            font-size: 1.5rem;
             margin-bottom: 1rem;
         }
 
+        .stat-icon-modern {
+            width: 55px;
+            height: 55px;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border-radius: 18px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.8rem;
+        }
+
+        .stat-trend {
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .trend-up {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
         .stat-number {
-            font-size: 2rem;
-            font-weight: 700;
+            font-size: 2.2rem;
+            font-weight: 800;
             margin-bottom: 0.3rem;
         }
 
-        .stat-label {
+        .stat-label-modern {
             font-size: 0.9rem;
             opacity: 0.8;
-        }
-
-        @keyframes fadeInUp {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
         }
 
         /* Action Grid */
         .action-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
             gap: 1rem;
             margin-bottom: 2rem;
         }
@@ -559,10 +737,9 @@ if(isset($_GET['view_hod_id'])){
             border-radius: 25px;
             padding: 1.5rem 0.8rem;
             text-align: center;
-            color: white;
+            transition: all 0.3s ease;
             cursor: pointer;
-            transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-            animation: fadeInScale 0.6s ease;
+            animation: fadeInScale 0.5s ease;
             animation-fill-mode: both;
         }
 
@@ -570,17 +747,21 @@ if(isset($_GET['view_hod_id'])){
         .action-card:nth-child(2) { animation-delay: 0.25s; }
         .action-card:nth-child(3) { animation-delay: 0.35s; }
         .action-card:nth-child(4) { animation-delay: 0.45s; }
+        .action-card:nth-child(5) { animation-delay: 0.55s; }
+        .action-card:nth-child(6) { animation-delay: 0.65s; }
+        .action-card:nth-child(7) { animation-delay: 0.75s; }
+        .action-card:nth-child(8) { animation-delay: 0.85s; }
 
         .action-card:hover {
             transform: translateY(-8px) scale(1.02);
             background: rgba(255, 255, 255, 0.2);
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+            box-shadow: var(--shadow-hover);
         }
 
         .action-icon {
             width: 60px;
             height: 60px;
-            background: linear-gradient(135deg, #ffd93d, #ff6b6b);
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
             border-radius: 20px;
             display: flex;
             align-items: center;
@@ -600,8 +781,520 @@ if(isset($_GET['view_hod_id'])){
         }
 
         .action-subtitle {
-            font-size: 0.75rem;
+            font-size: 0.7rem;
             opacity: 0.7;
+        }
+
+        /* Section Styles */
+        .section {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 30px;
+            padding: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .section-header h3 {
+            font-size: 1.2rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .section-header i {
+            color: var(--primary);
+        }
+
+        .badge {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            padding: 0.3rem 1rem;
+            border-radius: 50px;
+            font-size: 0.8rem;
+        }
+
+        /* Subject Cards */
+        .subject-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 1rem;
+        }
+
+        .subject-card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 18px;
+            padding: 1.2rem;
+            transition: all 0.3s ease;
+        }
+
+        .subject-card:hover {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateY(-3px);
+            border-color: var(--primary);
+        }
+
+        .subject-code {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--primary);
+            margin-bottom: 0.3rem;
+        }
+
+        .subject-name {
+            font-size: 1rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .subject-meta {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.85rem;
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        .subject-meta i {
+            margin-right: 0.3rem;
+            color: var(--primary);
+        }
+
+        /* Timetable Grid */
+        .timetable-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 0.8rem;
+            margin-top: 1rem;
+        }
+
+        .timetable-day {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 18px;
+            padding: 1rem;
+        }
+
+        .timetable-day h4 {
+            text-align: center;
+            margin-bottom: 0.8rem;
+            color: var(--primary);
+            font-weight: 600;
+            font-size: 1rem;
+        }
+
+        .timetable-period {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 0.6rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.85rem;
+            text-align: center;
+        }
+
+        .timetable-period strong {
+            color: var(--primary);
+        }
+
+        /* Table Styles */
+        .modern-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .modern-table th {
+            text-align: left;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.15);
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .modern-table td {
+            padding: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .modern-table tbody tr {
+            transition: all 0.3s ease;
+        }
+
+        .modern-table tbody tr:hover {
+            background: rgba(255, 255, 255, 0.15);
+            transform: scale(1.01);
+        }
+
+        /* Marks Input Styles */
+        .marks-input-written {
+            width: 80px;
+            padding: 0.5rem;
+            background: rgba(99, 102, 241, 0.1);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            border-radius: 10px;
+            color: white;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .marks-input-written:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
+        }
+
+        .marks-input-assignment {
+            width: 80px;
+            padding: 0.5rem;
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 10px;
+            color: white;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .marks-input-assignment:focus {
+            outline: none;
+            border-color: var(--success);
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+        }
+
+        .marks-input-dinamic {
+            width: 80px;
+            padding: 0.5rem;
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            border-radius: 10px;
+            color: white;
+            text-align: center;
+            transition: all 0.3s ease;
+        }
+
+        .marks-input-dinamic:focus {
+            outline: none;
+            border-color: var(--warning);
+            box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.2);
+        }
+
+        .marks-total {
+            width: 80px;
+            padding: 0.5rem;
+            background: rgba(99, 102, 241, 0.2);
+            border: 1px solid rgba(99, 102, 241, 0.4);
+            border-radius: 10px;
+            color: white;
+            text-align: center;
+            font-weight: 600;
+        }
+
+        /* Fee Collection Styles */
+        .fee-student-selector {
+            margin-bottom: 2rem;
+        }
+        
+        .student-search {
+            width: 100%;
+            padding: 1rem;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            color: white;
+            margin-bottom: 1rem;
+        }
+        
+        .student-list {
+            max-height: 300px;
+            overflow-y: auto;
+            border-radius: 12px;
+            background: rgba(0,0,0,0.2);
+        }
+        
+        .student-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .student-item:hover {
+            background: rgba(99, 102, 241, 0.1);
+        }
+        
+        .student-item.selected {
+            background: rgba(16, 185, 129, 0.2);
+            border-left: 4px solid var(--success);
+        }
+        
+        .student-info h4 {
+            font-size: 1.1rem;
+            margin-bottom: 0.2rem;
+        }
+        
+        .student-info p {
+            font-size: 0.8rem;
+            opacity: 0.7;
+        }
+        
+        .student-fee {
+            text-align: right;
+        }
+        
+        .student-fee .total {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--primary);
+        }
+        
+        .student-fee .paid {
+            font-size: 0.8rem;
+            color: var(--success);
+        }
+        
+        .balance-info {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .balance-label {
+            font-size: 0.9rem;
+            opacity: 0.7;
+        }
+        
+        .balance-amount {
+            font-size: 2rem;
+            font-weight: 700;
+            color: var(--success);
+        }
+        
+        .receipt-card {
+            background: white;
+            color: #333;
+            border-radius: 20px;
+            padding: 2rem;
+            margin-top: 1rem;
+        }
+        
+        .receipt-header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        
+        .receipt-header h3 {
+            color: var(--primary);
+            font-size: 1.5rem;
+        }
+        
+        .receipt-details {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+            margin: 1.5rem 0;
+        }
+        
+        .receipt-footer {
+            margin-top: 2rem;
+            text-align: right;
+            border-top: 1px dashed #ddd;
+            padding-top: 1rem;
+        }
+
+        /* Modal Styles */
+        .modal-modern {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            backdrop-filter: blur(15px);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .modal-modern.active {
+            display: flex;
+            opacity: 1;
+        }
+
+        .modal-content-modern {
+            background: linear-gradient(135deg, #1e293b, #0f172a);
+            border-radius: 40px;
+            padding: 2.5rem;
+            max-width: 1100px;
+            width: 95%;
+            max-height: 85vh;
+            overflow-y: auto;
+            position: relative;
+            transform: scale(0.9) translateY(20px);
+            transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: var(--shadow);
+        }
+
+        .modal-modern.active .modal-content-modern {
+            transform: scale(1) translateY(0);
+        }
+
+        .modal-header-modern {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .modal-header-modern h2 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff, #a5b4fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .modal-close-modern {
+            width: 45px;
+            height: 45px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 15px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .modal-close-modern:hover {
+            background: var(--danger);
+            transform: rotate(90deg);
+        }
+
+        /* Form Elements */
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .input-group-modern {
+            margin-bottom: 1rem;
+        }
+
+        .input-group-modern label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .input-modern {
+            width: 100%;
+            padding: 1rem 1.2rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid transparent;
+            border-radius: 20px;
+            color: white;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+        }
+
+        .input-modern:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: rgba(255, 255, 255, 0.15);
+            box-shadow: 0 0 30px rgba(99, 102, 241, 0.3);
+        }
+
+        .select-modern {
+            width: 100%;
+            padding: 1rem 1.2rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid transparent;
+            border-radius: 20px;
+            color: white;
+            font-size: 1rem;
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 1rem center;
+        }
+
+        .btn-modern {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            border: none;
+            border-radius: 20px;
+            padding: 1rem 2rem;
+            color: white;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            width: 100%;
+            font-size: 1rem;
+        }
+
+        .btn-modern:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 15px 30px rgba(99, 102, 241, 0.4);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #10b981, #059669);
+        }
+        
+        .btn-outline {
+            background: transparent;
+            border: 2px solid rgba(255,255,255,0.1);
+        }
+        
+        .btn-outline:hover {
+            border-color: var(--primary);
+        }
+
+        /* Animations */
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
         @keyframes fadeInScale {
@@ -615,24 +1308,26 @@ if(isset($_GET['view_hod_id'])){
             }
         }
 
-        /* Success Message */
-        .alert-success {
-            background: rgba(16, 185, 129, 0.2);
-            border: 1px solid rgba(16, 185, 129, 0.3);
-            border-radius: 15px;
-            padding: 1rem;
-            margin-bottom: 1rem;
-            color: #10b981;
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.5; }
+            50% { transform: scale(1.2); opacity: 0.8; }
+        }
+
+        /* Alert Messages */
+        .alert-modern {
+            padding: 1rem 1.5rem;
+            border-radius: 16px;
+            margin-bottom: 1.5rem;
             display: flex;
             align-items: center;
-            gap: 0.5rem;
-            animation: slideIn 0.5s ease;
+            gap: 1rem;
+            animation: slideIn 0.3s ease;
         }
 
         @keyframes slideIn {
             from {
                 opacity: 0;
-                transform: translateY(-20px);
+                transform: translateY(-10px);
             }
             to {
                 opacity: 1;
@@ -640,464 +1335,244 @@ if(isset($_GET['view_hod_id'])){
             }
         }
 
-        /* Search Section */
-        .search-section {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 20px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
+        .alert-modern.success {
+            background: rgba(16, 185, 129, 0.2);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--success);
         }
 
-        .search-wrapper {
-            position: relative;
+        .alert-modern.error {
+            background: rgba(239, 68, 68, 0.2);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: var(--danger);
         }
 
-        .search-icon {
-            position: absolute;
-            left: 1.5rem;
-            top: 50%;
-            transform: translateY(-50%);
-            color: rgba(255, 255, 255, 0.5);
-            font-size: 1.2rem;
+        .alert-modern.info {
+            background: rgba(99, 102, 241, 0.2);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: var(--primary);
         }
 
-        .search-field {
-            width: 100%;
-            padding: 1.2rem 1.2rem 1.2rem 3.5rem;
-            background: rgba(255, 255, 255, 0.15);
-            border: 2px solid transparent;
-            border-radius: 15px;
-            color: white;
-            font-size: 1rem;
-            transition: all 0.3s ease;
-        }
-
-        .search-field:focus {
-            outline: none;
-            border-color: #ffd93d;
-            background: rgba(255, 255, 255, 0.2);
-            box-shadow: 0 0 40px rgba(255, 217, 61, 0.3);
-        }
-
-        .search-field::placeholder {
-            color: rgba(255, 255, 255, 0.5);
-        }
-
-        /* Tab Navigation */
-        .tab-container {
+        /* Radio Group */
+        .radio-group-modern {
             display: flex;
             gap: 1rem;
-            margin-bottom: 2rem;
-            flex-wrap: wrap;
         }
 
-        .tab-btn {
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 50px;
-            padding: 0.8rem 2rem;
-            color: white;
-            font-weight: 600;
+        .radio-option {
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
             cursor: pointer;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
         }
 
-        .tab-btn:hover {
-            background: rgba(255, 255, 255, 0.2);
-            transform: translateY(-3px);
+        .radio-option input[type="radio"] {
+            accent-color: var(--primary);
+            width: 16px;
+            height: 16px;
         }
 
-        .tab-btn.active {
-            background: linear-gradient(135deg, #ffd93d, #ff6b6b);
-            color: #333;
-            border-color: transparent;
-        }
-
-        /* Table Section */
-        .table-section {
-            background: rgba(255, 255, 255, 0.1);
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 30px;
-            padding: 1.5rem;
-            margin-bottom: 2rem;
-            display: none;
-            animation: slideUp 0.6s ease;
-        }
-
-        .table-section.active {
-            display: block;
-        }
-
-        @keyframes slideUp {
-            from {
-                opacity: 0;
-                transform: translateY(20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 1.5rem;
-        }
-
-        .section-header h3 {
-            font-size: 1.3rem;
-            font-weight: 600;
-            color: white;
-        }
-
-        .section-header i {
-            margin-right: 0.5rem;
-            color: #ffd93d;
-        }
-
-        .add-btn {
-            background: linear-gradient(135deg, #00b09b, #96c93d);
-            border: none;
-            border-radius: 50px;
-            padding: 0.5rem 1.5rem;
-            color: white;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-
-        .add-btn:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 25px rgba(0, 176, 155, 0.4);
-        }
-
-        /* Modern Table */
-        .table-responsive {
-            overflow-x: auto;
-        }
-
-        .modern-table {
+        /* Progress Bar */
+        .progress-modern {
             width: 100%;
-            border-collapse: collapse;
-        }
-
-        .modern-table th {
-            text-align: left;
-            padding: 1rem;
-            background: rgba(255, 255, 255, 0.15);
-            color: white;
-            font-weight: 600;
-            font-size: 0.85rem;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        .modern-table td {
-            padding: 1rem;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            color: white;
-        }
-
-        .modern-table tbody tr {
-            transition: all 0.3s ease;
-        }
-
-        .modern-table tbody tr:hover {
+            height: 6px;
             background: rgba(255, 255, 255, 0.1);
-            transform: scale(1.01);
+            border-radius: 3px;
+            overflow: hidden;
         }
 
-        .action-badge {
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            border-radius: 3px;
+            transition: width 0.3s ease;
+        }
+
+        /* Badge Styles */
+        .badge-modern {
             padding: 0.3rem 0.8rem;
-            border-radius: 50px;
-            font-size: 0.8rem;
+            border-radius: 30px;
+            font-size: 0.75rem;
             font-weight: 600;
+            display: inline-block;
         }
 
         .badge-success {
             background: rgba(16, 185, 129, 0.2);
-            color: #10b981;
-        }
-
-        .badge-warning {
-            background: rgba(245, 158, 11, 0.2);
-            color: #f59e0b;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--success);
         }
 
         .badge-danger {
             background: rgba(239, 68, 68, 0.2);
-            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: var(--danger);
         }
 
-        .btn-icon {
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 10px;
-            padding: 0.4rem 0.8rem;
-            color: white;
-            text-decoration: none;
-            font-size: 0.8rem;
-            transition: all 0.3s ease;
-            margin: 0 2px;
-            display: inline-block;
-            cursor: pointer;
+        .badge-warning {
+            background: rgba(245, 158, 11, 0.2);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            color: var(--warning);
         }
 
-        .btn-icon:hover {
-            background: #ffd93d;
-            color: #333;
-            transform: translateY(-2px);
-        }
-
-        .btn-icon.delete:hover {
-            background: #ef4444;
-            color: white;
-        }
-
-        /* Modal Styles */
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0, 0, 0, 0.8);
-            backdrop-filter: blur(15px);
-            z-index: 9999;
-            justify-content: center;
-            align-items: center;
-            opacity: 0;
-            transition: opacity 0.3s ease;
-        }
-
-        .modal-overlay.active {
-            display: flex;
-            opacity: 1;
-        }
-
-        .modal-container {
-            background: linear-gradient(135deg, #1e293b, #0f172a);
-            border-radius: 40px;
-            padding: 2.5rem;
-            max-width: 900px;
-            width: 90%;
-            max-height: 85vh;
-            overflow-y: auto;
-            position: relative;
-            transform: scale(0.9) translateY(20px);
-            transition: all 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            box-shadow: 0 50px 100px rgba(0, 0, 0, 0.5);
-        }
-
-        .modal-overlay.active .modal-container {
-            transform: scale(1) translateY(0);
-        }
-
-        .modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 2rem;
-            padding-bottom: 1rem;
-            border-bottom: 2px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .modal-header h2 {
-            font-size: 1.8rem;
-            font-weight: 700;
-            color: white;
-        }
-
-        .modal-header i {
-            color: #ffd93d;
-            margin-right: 0.5rem;
-        }
-
-        .modal-close {
-            width: 45px;
-            height: 45px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 15px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 1.5rem;
-            color: white;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-
-        .modal-close:hover {
-            background: #ef4444;
-            transform: rotate(90deg);
-        }
-
-        /* Profile View Styles */
-        .profile-view {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
+        /* Profile Modal */
+        .profile-header-modern {
+            text-align: center;
             margin-bottom: 2rem;
         }
 
-        .profile-view-img {
-            width: 150px;
-            height: 150px;
+        .profile-avatar-modern {
+            width: 120px;
+            height: 120px;
             border-radius: 50%;
-            border: 4px solid #ffd93d;
+            border: 4px solid var(--primary);
             object-fit: cover;
-            margin-bottom: 1rem;
+            margin: 0 auto 1rem;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
         }
 
-        .profile-view-name {
-            font-size: 1.8rem;
+        .profile-avatar-placeholder {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 3rem;
             font-weight: 700;
             color: white;
+            margin: 0 auto 1rem;
         }
 
-        .profile-view-badge {
-            background: rgba(255, 217, 61, 0.2);
-            color: #ffd93d;
-            padding: 0.3rem 1rem;
-            border-radius: 50px;
-            font-size: 0.9rem;
-            margin-top: 0.5rem;
-        }
-
-        .details-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1rem;
-        }
-
-        .detail-item {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 15px;
-            padding: 1rem;
-        }
-
-        .detail-label {
-            font-size: 0.8rem;
-            color: rgba(255, 255, 255, 0.6);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+        .profile-name-modern {
+            font-size: 2rem;
+            font-weight: 700;
+            color: white;
             margin-bottom: 0.3rem;
         }
 
-        .detail-value {
-            font-size: 1.1rem;
-            font-weight: 600;
-            color: white;
+        .profile-title-modern {
+            color: var(--primary);
+            font-weight: 500;
+            font-size: 1rem;
         }
 
-        /* Form Styles */
-        .form-grid {
+        .profile-grid-modern {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
             gap: 1rem;
-            margin-bottom: 1rem;
         }
 
-        .form-group {
-            margin-bottom: 1rem;
+        .profile-item-modern {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 18px;
+            padding: 1.2rem;
+            transition: all 0.3s ease;
         }
 
-        .form-group label {
-            display: block;
-            margin-bottom: 0.5rem;
-            color: rgba(255, 255, 255, 0.8);
-            font-size: 0.9rem;
-            font-weight: 500;
-        }
-
-        .form-control {
-            width: 100%;
-            padding: 0.8rem 1rem;
+        .profile-item-modern:hover {
             background: rgba(255, 255, 255, 0.1);
-            border: 2px solid transparent;
-            border-radius: 15px;
-            color: white;
-            font-size: 0.95rem;
-            transition: all 0.3s ease;
+            transform: translateX(5px);
         }
 
-        .form-control:focus {
-            outline: none;
-            border-color: #ffd93d;
-            background: rgba(255, 255, 255, 0.15);
-            box-shadow: 0 0 30px rgba(255, 217, 61, 0.3);
+        .profile-item-label {
+            font-size: 0.75rem;
+            color: rgba(255, 255, 255, 0.5);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.3rem;
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
         }
 
-        .form-control::placeholder {
-            color: rgba(255, 255, 255, 0.4);
-        }
-
-        .form-control option {
-            background: #1e293b;
-            color: white;
-        }
-
-        .btn-submit {
-            background: linear-gradient(135deg, #00b09b, #96c93d);
-            border: none;
-            border-radius: 15px;
-            padding: 1rem 2rem;
-            color: white;
+        .profile-item-value {
+            font-size: 1rem;
             font-weight: 600;
-            width: 100%;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            margin-top: 1rem;
+            color: white;
         }
 
-        .btn-submit:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 15px 30px rgba(0, 176, 155, 0.4);
+        /* Marks Distribution Badges */
+        .marks-distribution {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            flex-wrap: wrap;
         }
 
-        /* Fee Status Styles */
-        .fee-badge {
-            padding: 0.3rem 0.8rem;
-            border-radius: 50px;
-            font-size: 0.8rem;
+        .marks-badge {
+            padding: 0.5rem 1.2rem;
+            border-radius: 30px;
+            font-size: 0.9rem;
             font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
         }
 
-        .fee-paid { background: rgba(16, 185, 129, 0.2); color: #10b981; }
-        .fee-partial { background: rgba(245, 158, 11, 0.2); color: #f59e0b; }
-        .fee-pending { background: rgba(239, 68, 68, 0.2); color: #ef4444; }
+        .marks-badge.primary {
+            background: rgba(99, 102, 241, 0.15);
+            border: 1px solid rgba(99, 102, 241, 0.3);
+            color: var(--primary);
+        }
 
-        /* Responsive */
+        .marks-badge.success {
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            color: var(--success);
+        }
+
+        .marks-badge.warning {
+            background: rgba(245, 158, 11, 0.15);
+            border: 1px solid rgba(245, 158, 11, 0.3);
+            color: var(--warning);
+        }
+
+        .marks-badge.total {
+            background: rgba(99, 102, 241, 0.25);
+            border: 1px solid rgba(99, 102, 241, 0.4);
+            color: white;
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1024px) {
+            .hero-title {
+                font-size: 2.5rem;
+            }
+        }
+
         @media (max-width: 768px) {
+            .app {
+                padding: 1rem;
+            }
+
             .glass-nav {
                 flex-direction: column;
                 gap: 1rem;
-                text-align: center;
+                padding: 1rem;
             }
 
-            .admin-info {
+            .nav-actions {
+                width: 100%;
+                justify-content: center;
+            }
+
+            .hero-title {
+                font-size: 2rem;
+            }
+
+            .hero-stats {
                 flex-direction: column;
+                gap: 1rem;
             }
 
             .action-grid {
                 grid-template-columns: repeat(2, 1fr);
             }
 
-            .modal-container {
+            .modal-content-modern {
                 padding: 1.5rem;
             }
         }
@@ -1111,1385 +1586,1072 @@ if(isset($_GET['view_hod_id'])){
                 grid-template-columns: 1fr;
             }
 
-            .tab-container {
-                justify-content: center;
+            .timetable-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+
+            .hero-title {
+                font-size: 1.5rem;
+            }
+
+            .marks-distribution {
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+            
+            .receipt-details {
+                grid-template-columns: 1fr;
             }
         }
 
-        /* Scrollbar */
+        /* Scrollbar Styling */
         ::-webkit-scrollbar {
             width: 8px;
+            height: 8px;
         }
 
         ::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
         }
 
         ::-webkit-scrollbar-thumb {
-            background: linear-gradient(135deg, #ffd93d, #ff6b6b);
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
             border-radius: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: linear-gradient(135deg, var(--secondary), var(--primary));
         }
     </style>
 </head>
 <body>
     <!-- Animated Background -->
-    <div class="bg-orb orb-1"></div>
-    <div class="bg-orb orb-2"></div>
-    <div class="bg-orb orb-3"></div>
-    <div class="grid-pattern"></div>
+    <div id="gradient-bg"></div>
+    <div class="noise"></div>
 
-    <!-- Main Dashboard -->
-    <div class="dashboard">
-        <!-- Navigation -->
+    <!-- Floating Particles -->
+    <div id="particles-container"></div>
+
+    <!-- Main App Container -->
+    <div class="app">
+        <!-- Glass Navigation -->
         <nav class="glass-nav">
-            <div class="admin-info">
-                <div class="admin-avatar">
-                    <i class="fas fa-crown"></i>
+            <div class="logo">
+                <div class="logo-icon">
+                    <i class="fas fa-gem"></i>
                 </div>
-                <div class="admin-details">
-                    <h2>A.A.N.M & V.V.R.S.R POLYTECHNIC(Administrator)</h2>
-                    <p>College Management System</p>
+                <div class="logo-text">
+                    <h1>A.A.N.M & V.V.R.S.R POLYTECHNIC</h1>
+                    <p><?php echo htmlspecialchars($employee_department); ?> Department</p>
                 </div>
             </div>
-            <a href="../logout.php" class="logout-btn">
-                <i class="fas fa-sign-out-alt"></i>
-                Logout
-            </a>
+            
+            <div class="nav-actions">
+                <div class="theme-toggle" onclick="toggleTheme()">
+                    <i class="fas fa-moon"></i>
+                </div>
+                <a href="../logout.php" class="logout-btn">
+                    <i class="fas fa-sign-out-alt"></i>
+                    <span>Logout</span>
+                </a>
+            </div>
         </nav>
 
-        <!-- Success/Error Messages -->
-        <?php if(isset($_GET['msg'])): ?>
-            <?php if($_GET['msg'] == 'student_deleted'): ?>
-            <div class="alert-success">
-                <i class="fas fa-check-circle"></i> Student deleted successfully!
+        <!-- Hero Section -->
+        <div class="hero-section">
+            <div class="hero-content">
+                <div class="greeting">Welcome back,</div>
+                <h1 class="hero-title">
+                    <?php echo htmlspecialchars(explode(' ', $emp['name'])[0]); ?> <span><?php echo htmlspecialchars(explode(' ', $emp['name'])[1] ?? ''); ?></span>
+                </h1>
+                <p style="opacity: 0.8; max-width: 600px;">Manage your classes, track attendance, evaluate performance, and collect fees from one central hub.</p>
+                
+                <div class="hero-stats">
+                    <div class="hero-stat-item">
+                        <div class="hero-stat-icon">
+                            <i class="fas fa-briefcase" style="color: #ffd700;"></i>
+                        </div>
+                        <div class="hero-stat-info">
+                            <h4><?php echo htmlspecialchars($emp['profession']); ?></h4>
+                            <p>Designation</p>
+                        </div>
+                    </div>
+                    <div class="hero-stat-item">
+                        <div class="hero-stat-icon">
+                            <i class="fas fa-rupee-sign" style="color: #10b981;"></i>
+                        </div>
+                        <div class="hero-stat-info">
+                            <h4>₹<?php echo number_format($emp['salary']); ?></h4>
+                            <p>Monthly Salary</p>
+                        </div>
+                    </div>
+                </div>
             </div>
-            <?php elseif($_GET['msg'] == 'employee_deleted'): ?>
-            <div class="alert-success">
-                <i class="fas fa-check-circle"></i> Employee deleted successfully!
-            </div>
-            <?php elseif($_GET['msg'] == 'hod_deleted'): ?>
-            <div class="alert-success">
-                <i class="fas fa-check-circle"></i> HOD deleted successfully!
-            </div>
-            <?php elseif($_GET['msg'] == 'student_delete_error'): ?>
-            <div class="alert-success" style="background: rgba(239,68,68,0.2); color:#ef4444;">
-                <i class="fas fa-exclamation-circle"></i> Error deleting student!
-            </div>
-            <?php endif; ?>
-        <?php endif; ?>
-
-        <?php if(isset($student_success)): ?>
-        <div class="alert-success">
-            <i class="fas fa-check-circle"></i> <?php echo $student_success; ?>
+            <div class="hero-pattern"></div>
         </div>
-        <?php endif; ?>
 
-        <?php if(isset($employee_success)): ?>
-        <div class="alert-success">
-            <i class="fas fa-check-circle"></i> <?php echo $employee_success; ?>
-        </div>
-        <?php endif; ?>
-
-        <?php if(isset($hod_success)): ?>
-        <div class="alert-success">
-            <i class="fas fa-check-circle"></i> <?php echo $hod_success; ?>
-        </div>
-        <?php endif; ?>
-
-        <!-- Statistics Grid -->
+        <!-- Quick Stats Grid -->
         <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-icon">
-                    <i class="fas fa-users"></i>
+            <div class="stat-card-modern">
+                <div class="stat-header">
+                    <div class="stat-icon-modern">
+                        <i class="fas fa-book-open"></i>
+                    </div>
+                    <span class="stat-trend trend-up">Active</span>
                 </div>
-                <div class="stat-number"><?php echo $totalStudents; ?></div>
-                <div class="stat-label">Total Students</div>
+                <div class="stat-number"><?php echo $assigned_subjects->num_rows; ?></div>
+                <div class="stat-label-modern">Assigned Subjects</div>
             </div>
             
-            <div class="stat-card">
-                <div class="stat-icon">
-                    <i class="fas fa-user-tie"></i>
+            <div class="stat-card-modern">
+                <div class="stat-header">
+                    <div class="stat-icon-modern">
+                        <i class="fas fa-users"></i>
+                    </div>
+                    <span class="stat-trend trend-up">Total</span>
                 </div>
-                <div class="stat-number"><?php echo $totalEmployee; ?></div>
-                <div class="stat-label">Total Employees</div>
+                <div class="stat-number"><?php echo $students; ?></div>
+                <div class="stat-label-modern">Department Students</div>
             </div>
             
-            <div class="stat-card">
-                <div class="stat-icon">
-                    <i class="fas fa-crown"></i>
+            <div class="stat-card-modern">
+                <div class="stat-header">
+                    <div class="stat-icon-modern">
+                        <i class="fas fa-calendar-week"></i>
+                    </div>
+                    <span class="stat-trend trend-up">This Week</span>
                 </div>
-                <div class="stat-number"><?php echo $totalHOD; ?></div>
-                <div class="stat-label">Department Heads</div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-icon">
-                    <i class="fas fa-wallet"></i>
-                </div>
-                <div class="stat-number">₹<?php echo number_format($totalFees); ?></div>
-                <div class="stat-label">Total Fees</div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-icon">
-                    <i class="fas fa-check-circle"></i>
-                </div>
-                <div class="stat-number">₹<?php echo number_format($totalCollected); ?></div>
-                <div class="stat-label">Collected</div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-icon">
-                    <i class="fas fa-exclamation-triangle"></i>
-                </div>
-                <div class="stat-number">₹<?php echo number_format($totalDue); ?></div>
-                <div class="stat-label">Due Amount</div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-icon">
-                    <i class="fas fa-coins"></i>
-                </div>
-                <div class="stat-number">₹<?php echo number_format($totalSalary); ?></div>
-                <div class="stat-label">Total Salary</div>
+                <div class="stat-number"><?php echo $employee_timetable->num_rows; ?></div>
+                <div class="stat-label-modern">Scheduled Periods</div>
             </div>
         </div>
 
-        <!-- Action Buttons -->
+        <!-- Action Grid -->
         <div class="action-grid">
-            <div class="action-card" onclick="openModal('addStudentModal')">
+            <div class="action-card" onclick="openModal('profileModal')">
                 <div class="action-icon">
-                    <i class="fas fa-user-graduate"></i>
+                    <i class="fas fa-user-circle"></i>
                 </div>
-                <div class="action-title">Add Student</div>
-                <div class="action-subtitle">Register new student</div>
+                <div class="action-title">My Profile</div>
+                <div class="action-subtitle">View personal details</div>
             </div>
             
-            <div class="action-card" onclick="openModal('addEmployeeModal')">
+            <div class="action-card" onclick="openModal('attendanceModal')">
                 <div class="action-icon">
-                    <i class="fas fa-user-tie"></i>
+                    <i class="fas fa-calendar-check"></i>
                 </div>
-                <div class="action-title">Add Employee</div>
-                <div class="action-subtitle">Register new employee</div>
+                <div class="action-title">Mark Attendance</div>
+                <div class="action-subtitle">Daily attendance</div>
             </div>
             
-            <div class="action-card" onclick="openModal('addHODModal')">
+            <div class="action-card" onclick="openModal('marksModal')">
                 <div class="action-icon">
-                    <i class="fas fa-crown"></i>
+                    <i class="fas fa-star"></i>
                 </div>
-                <div class="action-title">Add HOD</div>
-                <div class="action-subtitle">Department head</div>
+                <div class="action-title">Enter Marks</div>
+                <div class="action-subtitle">Internal assessments</div>
             </div>
             
-            <div class="action-card" onclick="openModal('feeStatusModal')">
+            <div class="action-card" onclick="openModal('feeModal')">
                 <div class="action-icon">
-                    <i class="fas fa-chart-pie"></i>
+                    <i class="fas fa-rupee-sign"></i>
                 </div>
-                <div class="action-title">Fee Status</div>
-                <div class="action-subtitle">View collection</div>
+                <div class="action-title">Collect Fee</div>
+                <div class="action-subtitle">Student fee collection</div>
+            </div>
+            
+            <div class="action-card" onclick="openModal('viewAttendanceModal')">
+                <div class="action-icon">
+                    <i class="fas fa-eye"></i>
+                </div>
+                <div class="action-title">View Attendance</div>
+                <div class="action-subtitle">Overall report</div>
+            </div>
+            
+            <div class="action-card" onclick="openModal('monthlyReportModal')">
+                <div class="action-icon">
+                    <i class="fas fa-chart-line"></i>
+                </div>
+                <div class="action-title">Monthly Report</div>
+                <div class="action-subtitle"><?php echo date('F Y'); ?></div>
+            </div>
+            
+            <div class="action-card" onclick="openModal('timetableModal')">
+                <div class="action-icon">
+                    <i class="fas fa-calendar-alt"></i>
+                </div>
+                <div class="action-title">My Timetable</div>
+                <div class="action-subtitle">Weekly schedule</div>
+            </div>
+            
+            <div class="action-card" onclick="openModal('subjectsModal')">
+                <div class="action-icon">
+                    <i class="fas fa-book-open"></i>
+                </div>
+                <div class="action-title">My Subjects</div>
+                <div class="action-subtitle">Assigned subjects</div>
             </div>
         </div>
 
-        <!-- Search Section -->
-        <div class="search-section">
-            <div class="search-wrapper">
-                <i class="fas fa-search search-icon"></i>
-                <input type="text" id="globalSearch" class="search-field" placeholder="Search students, employees, or HODs...">
-            </div>
-        </div>
-
-        <!-- Tab Navigation -->
-        <div class="tab-container">
-            <div class="tab-btn active" onclick="switchTab('students')">
-                <i class="fas fa-users"></i> Students
-            </div>
-            <div class="tab-btn" onclick="switchTab('employees')">
-                <i class="fas fa-user-tie"></i> Employees
-            </div>
-            <div class="tab-btn" onclick="switchTab('hods')">
-                <i class="fas fa-crown"></i> HODs
-            </div>
-        </div>
-
-        <!-- Students Table Section -->
-        <div id="students-section" class="table-section active">
+        <!-- Subjects Preview -->
+        <div class="section">
             <div class="section-header">
-                <h3><i class="fas fa-users"></i> Student List</h3>
-                <button class="add-btn" onclick="openModal('addStudentModal')">
-                    <i class="fas fa-plus"></i> Add Student
+                <h3><i class="fas fa-book-open"></i> My Assigned Subjects</h3>
+                <span class="badge"><?php echo $assigned_subjects->num_rows; ?> Subjects</span>
+            </div>
+
+            <?php if($assigned_subjects->num_rows > 0): ?>
+            <div class="subject-grid">
+                <?php 
+                $assigned_subjects->data_seek(0);
+                $count = 0;
+                while($subject = $assigned_subjects->fetch_assoc()): 
+                    if($count >= 4) break;
+                    $count++;
+                ?>
+                <div class="subject-card">
+                    <div class="subject-code"><?php echo htmlspecialchars($subject['subject_code']); ?></div>
+                    <div class="subject-name"><?php echo htmlspecialchars($subject['subject_name']); ?></div>
+                    <div class="subject-meta">
+                        <span><i class="fas fa-layer-group"></i> Sem <?php echo $subject['semester']; ?></span>
+                        <span><i class="fas fa-users"></i> Sec <?php echo $subject['section']; ?></span>
+                    </div>
+                </div>
+                <?php endwhile; ?>
+            </div>
+            <?php if($assigned_subjects->num_rows > 4): ?>
+            <div style="text-align: center; margin-top: 1rem;">
+                <button class="btn-modern" style="width: auto; padding: 0.5rem 2rem;" onclick="openModal('subjectsModal')">
+                    View All <?php echo $assigned_subjects->num_rows; ?> Subjects
                 </button>
             </div>
-            
-            <div class="table-responsive">
-                <table class="modern-table" id="studentsTable">
-                    <thead>
-                        <tr>
-                            <th>Roll No</th>
-                            <th>Name</th>
-                            <th>Email</th>
-                            <th>Department</th>
-                            <th>Sem/Sec</th>
-                            <th>Total Fee</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php 
-                        $students->data_seek(0);
-                        while($row = $students->fetch_assoc()): 
-                        ?>
-                        <tr>
-                            <td><strong><?php echo htmlspecialchars($row['roll_no']); ?></strong></td>
-                            <td><?php echo htmlspecialchars($row['name']); ?></td>
-                            <td><?php echo htmlspecialchars($row['email']); ?></td>
-                            <td><?php echo htmlspecialchars($row['department'] ?? $row['course']); ?></td>
-                            <td><?php echo ($row['semester'] ?? 'N/A') . ' / ' . ($row['section'] ?? 'N/A'); ?></td>
-                            <td>₹<?php echo number_format($row['total_fee']); ?></td>
-                            <td>
-                                <button class="btn-icon" onclick="viewStudent(<?php echo $row['id']; ?>)">
-                                    <i class="fas fa-eye"></i>
-                                </button>
-                                <button class="btn-icon" onclick="editStudent(<?php echo $row['id']; ?>)">
-                                    <i class="fas fa-edit"></i>
-                                </button>
-                                <a href="?delete_student=<?php echo $row['id']; ?>" class="btn-icon delete" onclick="return confirm('Delete this student?')">
-                                    <i class="fas fa-trash"></i>
-                                </a>
-                            </td>
-                        </tr>
-                        <?php endwhile; ?>
-                    </tbody>
-                </table>
-            </div>
+            <?php endif; ?>
+            <?php endif; ?>
         </div>
 
-        <!-- Employees Table Section -->
-        <div id="employees-section" class="table-section">
+        <!-- Timetable Preview -->
+        <div class="section">
             <div class="section-header">
-                <h3><i class="fas fa-user-tie"></i> Employee List</h3>
-                <button class="add-btn" onclick="openModal('addEmployeeModal')">
-                    <i class="fas fa-plus"></i> Add Employee
-                </button>
+                <h3><i class="fas fa-calendar-alt"></i> Weekly Timetable</h3>
+                <span class="badge">This Week</span>
             </div>
-            
-            <div class="table-responsive">
-                <table class="modern-table" id="employeesTable">
-                    <thead>
-                        <tr>
-                            <th>Emp ID</th>
-                            <th>Name</th>
-                            <th>Department</th>
-                            <th>Email</th>
-                            <th>Phone</th>
-                            <th>Profession</th>
-                            <th>Salary</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php 
-                        $employees->data_seek(0);
-                        while($row = $employees->fetch_assoc()): 
-                        ?>
-                        <tr>
-                            <td><strong><?php echo htmlspecialchars($row['emp_id']); ?></strong></td>
-                            <td><?php echo htmlspecialchars($row['name']); ?></td>
-                            <td><?php echo htmlspecialchars($row['department']); ?></td>
-                            <td><?php echo htmlspecialchars($row['email']); ?></td>
-                            <td><?php echo htmlspecialchars($row['phone']); ?></td>
-                            <td><?php echo htmlspecialchars($row['profession']); ?></td>
-                            <td>₹<?php echo number_format($row['salary']); ?></td>
-                            <td>
-                                <button class="btn-icon" onclick="viewEmployee('<?php echo $row['emp_id']; ?>')">
-                                    <i class="fas fa-eye"></i>
-                                </button>
-                                <button class="btn-icon" onclick="editEmployee('<?php echo $row['emp_id']; ?>')">
-                                    <i class="fas fa-edit"></i>
-                                </button>
-                                <a href="?delete_employee=<?php echo $row['emp_id']; ?>" class="btn-icon delete" onclick="return confirm('Delete this employee?')">
-                                    <i class="fas fa-trash"></i>
-                                </a>
-                            </td>
-                        </tr>
-                        <?php endwhile; ?>
-                    </tbody>
-                </table>
-            </div>
-        </div>
 
-        <!-- HODs Table Section -->
-        <div id="hods-section" class="table-section">
-            <div class="section-header">
-                <h3><i class="fas fa-crown"></i> Department Heads (HODs)</h3>
-                <button class="add-btn" onclick="openModal('addHODModal')">
-                    <i class="fas fa-plus"></i> Add HOD
-                </button>
+            <?php if($employee_timetable->num_rows > 0): ?>
+            <div class="timetable-grid">
+                <?php
+                $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+                foreach($days as $day):
+                    $day_periods = [];
+                    $employee_timetable->data_seek(0);
+                    while($period = $employee_timetable->fetch_assoc()) {
+                        if($period['day_of_week'] == $day) {
+                            $day_periods[] = $period;
+                        }
+                    }
+                ?>
+                <div class="timetable-day">
+                    <h4><?php echo substr($day, 0, 3); ?></h4>
+                    <?php if(!empty($day_periods)): ?>
+                        <?php foreach($day_periods as $period): ?>
+                        <div class="timetable-period">
+                            <strong>P<?php echo $period['period']; ?></strong><br>
+                            <?php echo htmlspecialchars($period['subject_code']); ?><br>
+                            <small>Sec <?php echo htmlspecialchars($period['section']); ?></small>
+                        </div>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <div style="opacity: 0.3; text-align: center; padding: 0.5rem;">
+                            <small>No classes</small>
+                        </div>
+                    <?php endif; ?>
+                </div>
+                <?php endforeach; ?>
             </div>
-            
-            <div class="table-responsive">
-                <table class="modern-table" id="hodsTable">
-                    <thead>
-                        <tr>
-                            <th>HOD ID</th>
-                            <th>Name</th>
-                            <th>Department</th>
-                            <th>Email</th>
-                            <th>Phone</th>
-                            <th>Qualification</th>
-                            <th>Experience</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- ==================== PROFILE MODAL ==================== -->
+    <div id="profileModal" class="modal-modern">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-user-circle"></i> My Profile</h2>
+                <div class="modal-close-modern" onclick="closeModal('profileModal')">
+                    <i class="fas fa-times"></i>
+                </div>
+            </div>
+
+            <div class="profile-header-modern">
+                <?php if(!empty($emp['photo']) && file_exists("../uploads/".$emp['photo'])): ?>
+                    <img src="../uploads/<?php echo htmlspecialchars($emp['photo']); ?>" class="profile-avatar-modern">
+                <?php else: ?>
+                    <div class="profile-avatar-placeholder">
+                        <?php echo strtoupper(substr($emp['name'], 0, 2)); ?>
+                    </div>
+                <?php endif; ?>
+                <h3 class="profile-name-modern"><?php echo htmlspecialchars($emp['name']); ?></h3>
+                <div class="profile-title-modern"><?php echo htmlspecialchars($emp['profession']); ?></div>
+            </div>
+
+            <div class="profile-grid-modern">
+                <?php
+                $profile_fields = [
+                    'emp_id' => ['icon' => 'fa-id-card', 'label' => 'Employee ID'],
+                    'dob' => ['icon' => 'fa-calendar', 'label' => 'Date of Birth'],
+                    'department' => ['icon' => 'fa-building', 'label' => 'Department'],
+                    'phone' => ['icon' => 'fa-phone', 'label' => 'Phone'],
+                    'email' => ['icon' => 'fa-envelope', 'label' => 'Email'],
+                    'category' => ['icon' => 'fa-tag', 'label' => 'Category'],
+                    'father_name' => ['icon' => 'fa-user-tie', 'label' => 'Father\'s Name'],
+                    'blood_group' => ['icon' => 'fa-droplet', 'label' => 'Blood Group'],
+                    'permanent_address' => ['icon' => 'fa-map-marker-alt', 'label' => 'Address'],
+                    'profession' => ['icon' => 'fa-briefcase', 'label' => 'Profession'],
+                    'salary' => ['icon' => 'fa-rupee-sign', 'label' => 'Salary'],
+                    'username' => ['icon' => 'fa-user', 'label' => 'Username']
+                ];
+
+                foreach($profile_fields as $field => $data):
+                    if(isset($emp[$field]) && !empty($emp[$field])):
+                ?>
+                <div class="profile-item-modern">
+                    <div class="profile-item-label">
+                        <i class="fas <?php echo $data['icon']; ?>"></i> <?php echo $data['label']; ?>
+                    </div>
+                    <div class="profile-item-value">
                         <?php 
-                        $hods->data_seek(0);
-                        while($row = $hods->fetch_assoc()): 
+                        if($field == 'salary') echo '₹' . number_format($emp[$field]);
+                        elseif($field == 'dob') echo date('d M Y', strtotime($emp[$field]));
+                        else echo htmlspecialchars($emp[$field]); 
                         ?>
-                        <tr>
-                            <td><strong><?php echo htmlspecialchars($row['hod_id']); ?></strong></td>
-                            <td><?php echo htmlspecialchars($row['name']); ?></td>
-                            <td><span class="badge-success" style="padding:0.3rem 0.8rem;"><?php echo htmlspecialchars($row['department']); ?></span></td>
-                            <td><?php echo htmlspecialchars($row['email']); ?></td>
-                            <td><?php echo htmlspecialchars($row['phone']); ?></td>
-                            <td><?php echo htmlspecialchars($row['qualification']); ?></td>
-                            <td><?php echo $row['experience']; ?> years</td>
-                            <td>
-                                <button class="btn-icon" onclick="viewHOD(<?php echo $row['id']; ?>)">
-                                    <i class="fas fa-eye"></i>
-                                </button>
-                                <button class="btn-icon" onclick="editHOD(<?php echo $row['id']; ?>)">
-                                    <i class="fas fa-edit"></i>
-                                </button>
-                                <a href="?delete_hod=<?php echo $row['id']; ?>" class="btn-icon delete" onclick="return confirm('Delete this HOD?')">
-                                    <i class="fas fa-trash"></i>
-                                </a>
-                            </td>
-                        </tr>
-                        <?php endwhile; ?>
-                    </tbody>
-                </table>
+                    </div>
+                </div>
+                <?php endif; endforeach; ?>
             </div>
         </div>
     </div>
 
-    <!-- ==================== ADD STUDENT MODAL ==================== -->
-    <div id="addStudentModal" class="modal-overlay">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-user-graduate"></i> Add New Student</h2>
-                <div class="modal-close" onclick="closeModal('addStudentModal')">&times;</div>
+    <!-- ==================== MARK ATTENDANCE MODAL ==================== -->
+    <div id="attendanceModal" class="modal-modern <?php echo $show_students ? 'active' : ''; ?>">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-calendar-check"></i> Mark Attendance</h2>
+                <div class="modal-close-modern" onclick="closeModal('attendanceModal')">
+                    <i class="fas fa-times"></i>
+                </div>
             </div>
-            
-            <?php if(isset($student_success)): ?>
-            <div class="alert-success">
-                <i class="fas fa-check-circle"></i> <?php echo $student_success; ?>
+
+            <?php if($attendance_error): ?>
+            <div class="alert-modern error">
+                <i class="fas fa-exclamation-circle"></i> <?php echo $attendance_error; ?>
             </div>
             <?php endif; ?>
 
-            <form method="POST" enctype="multipart/form-data">
+            <?php if(isset($_GET['attendance_success'])): ?>
+            <div class="alert-modern success">
+                <i class="fas fa-check-circle"></i> Attendance saved! Present: <?php echo $_GET['present']; ?>, Absent: <?php echo $_GET['absent']; ?>
+            </div>
+            <?php endif; ?>
+
+            <!-- Load Students Form - Shows when no students are loaded -->
+            <?php if(!$show_students): ?>
+            <form method="POST">
                 <div class="form-grid">
-                    <div class="form-group">
-                        <label>Roll Number</label>
-                        <input type="text" name="roll_no" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" name="name" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Date of Birth</label>
-                        <input type="date" name="dob" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" name="password" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="text" name="phone" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Course</label>
-                        <input type="text" name="course" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Department</label>
-                        <select name="department" class="form-control" required>
-                            <option value="">Select Department</option>
-                            <option value="AIML">AIML</option>
-                            <option value="CSE">CSE</option>
-                            <option value="IOT">IOT</option>
-                            <option value="ECE">ECE</option>
-                            <option value="MECH">MECH</option>
-                            <option value="CIVIL">CIVIL</option>
-                            <option value="EEE">EEE</option>
+                    <div class="input-group-modern">
+                        <label>Subject</label>
+                        <select name="subject_code" class="select-modern" required>
+                            <option value="">Select Subject</option>
+                            <?php
+                            $assigned_subjects->data_seek(0);
+                            while($sub = $assigned_subjects->fetch_assoc()):
+                            ?>
+                            <option value="<?php echo $sub['subject_code']; ?>">
+                                <?php echo $sub['subject_code']; ?> - <?php echo $sub['subject_name']; ?> (Sec <?php echo $sub['section']; ?>)
+                            </option>
+                            <?php endwhile; ?>
                         </select>
                     </div>
-                    
-                    <div class="form-group">
-                        <label>Semester</label>
-                        <select name="semester" class="form-control" required>
-                            <option value="">Select Semester</option>
-                            <option value="1">Semester 1</option>
-                            <option value="2">Semester 2</option>
-                            <option value="3">Semester 3</option>
-                            <option value="4">Semester 4</option>
-                            <option value="5">Semester 5</option>
-                            <option value="6">Semester 6</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
+
+                    <div class="input-group-modern">
                         <label>Section</label>
-                        <select name="section" class="form-control" required>
+                        <select name="section" class="select-modern" required>
                             <option value="">Select Section</option>
-                            <option value="1A">Section 1A</option>
-                            <option value="1B">Section 1B</option>
-                            <option value="1C">Section 1C</option>
-                            <option value="1D">Section 1D</option>
-			   
-                            <option value="2A">Section 2A</option>
-                            <option value="2B">Section 2B</option>
-                            <option value="2C">Section 2C</option>
-                            <option value="2D">Section 2D</option>
- 	 		 
-                            <option value="3A">Section 3A</option>
-                            <option value="3B">Section 3B</option>
-                            <option value="3C">Section 3C</option>
-                            <option value="3D">Section 3D</option>
+                            <?php
+                            $sections->data_seek(0);
+                            while($sec = $sections->fetch_assoc()):
+                            ?>
+                            <option value="<?php echo $sec['section']; ?>">Section <?php echo $sec['section']; ?></option>
+                            <?php endwhile; ?>
                         </select>
                     </div>
-                    
-                    <div class="form-group">
-                        <label>Total Fee</label>
-                        <input type="number" name="total_fee" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>SSC Marks</label>
-                        <input type="number" name="ssc_marks" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Polycet Rank</label>
-                        <input type="number" name="polycet_rank" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Category</label>
-                        <select name="category" class="form-control" required>
-                            <option value="">Select Category</option>
-                            <option>OC</option>
-                            <option>BC</option>
-                            <option>SC</option>
-                            <option>ST</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Father's Name</label>
-                        <input type="text" name="father_name" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Mother's Name</label>
-                        <input type="text" name="mother_name" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Blood Group</label>
-                        <select name="blood_group" class="form-control" required>
-                            <option value="">Select Blood Group</option>
-                            <option>A+</option><option>A-</option><option>B+</option><option>B-</option>
-                            <option>O+</option><option>O-</option><option>AB+</option><option>AB-</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Permanent Address</label>
-                        <textarea name="permanent_address" class="form-control" required></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Local Address</label>
-                        <textarea name="local_address" class="form-control" required></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Photo</label>
-                        <input type="file" name="photo" class="form-control" accept="image/*">
+
+                    <div class="input-group-modern">
+                        <label>Date</label>
+                        <input type="date" name="attendance_date" class="input-modern" value="<?php echo date('Y-m-d'); ?>" required>
                     </div>
                 </div>
                 
-                <button type="submit" name="add_student" class="btn-submit">
-                    <i class="fas fa-save"></i> Add Student
+                <button type="submit" name="load_attendance_students" class="btn-modern">
+                    <i class="fas fa-users"></i> Load Students
                 </button>
             </form>
+            <?php endif; ?>
+
+            <!-- Student attendance form - Shows when students are loaded -->
+            <?php if($show_students): 
+                $students_list = $conn->query("SELECT * FROM students WHERE department='$employee_department' AND section='{$_SESSION['attendance_section']}' ORDER BY roll_no");
+            ?>
+            <form method="POST">
+                <input type="hidden" name="subject_code" value="<?php echo $_SESSION['attendance_subject']; ?>">
+                <input type="hidden" name="section" value="<?php echo $_SESSION['attendance_section']; ?>">
+                <input type="hidden" name="attendance_date" value="<?php echo $_SESSION['attendance_date']; ?>">
+
+                <div style="max-height: 400px; overflow-y: auto; margin: 1.5rem 0;">
+                    <table class="modern-table">
+                        <thead>
+                            <tr>
+                                <th>Roll No</th>
+                                <th>Name</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php while($student = $students_list->fetch_assoc()): ?>
+                            <tr>
+                                <td><?php echo $student['roll_no']; ?></td>
+                                <td><?php echo $student['name']; ?></td>
+                                <td>
+                                    <div class="radio-group-modern">
+                                        <label class="radio-option">
+                                            <input type="radio" name="attendance[<?php echo $student['id']; ?>]" value="Present" checked> Present
+                                        </label>
+                                        <label class="radio-option">
+                                            <input type="radio" name="attendance[<?php echo $student['id']; ?>]" value="Absent"> Absent
+                                        </label>
+                                    </div>
+                                </td>
+                            </tr>
+                            <?php endwhile; ?>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div style="display: flex; gap: 1rem;">
+                    <button type="submit" name="submit_attendance" class="btn-modern">
+                        <i class="fas fa-save"></i> Save Attendance
+                    </button>
+                </div>
+            </form>
+            <?php endif; ?>
         </div>
     </div>
 
-    <!-- ==================== ADD EMPLOYEE MODAL ==================== -->
-    <div id="addEmployeeModal" class="modal-overlay">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-user-tie"></i> Add New Employee</h2>
-                <div class="modal-close" onclick="closeModal('addEmployeeModal')">&times;</div>
+    <!-- ==================== ENTER MARKS MODAL ==================== -->
+    <div id="marksModal" class="modal-modern <?php echo $show_marks_students ? 'active' : ''; ?>">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-star"></i> Enter Internal Marks</h2>
+                <div class="modal-close-modern" onclick="closeModal('marksModal')">
+                    <i class="fas fa-times"></i>
+                </div>
             </div>
-            
-            <?php if(isset($employee_success)): ?>
-            <div class="alert-success">
-                <i class="fas fa-check-circle"></i> <?php echo $employee_success; ?>
+
+            <?php if($marks_error): ?>
+            <div class="alert-modern error">
+                <i class="fas fa-exclamation-circle"></i> <?php echo $marks_error; ?>
             </div>
             <?php endif; ?>
 
-            <form method="POST" enctype="multipart/form-data">
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Employee ID</label>
-                        <input type="text" name="empid" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" name="name" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Date of Birth</label>
-                        <input type="date" name="dob" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Department</label>
-                        <select name="department" class="form-control" required>
-                            <option value="">Select Department</option>
-                            <option value="AIML">AIML</option>
-                            <option value="CSE">CSE</option>
-                              <option value="IOT">IOT</option>
-                            <option value="ECE">ECE</option>
-                            <option value="MECH">MECH</option>
-                            <option value="CIVIL">CIVIL</option>
-                            <option value="EEE">EEE</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="text" name="phone" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Category</label>
-                        <input type="text" name="category" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Father's Name</label>
-                        <input type="text" name="father_name" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Blood Group</label>
-                        <select name="blood_group" class="form-control" required>
-                            <option value="">Select Blood Group</option>
-                            <option>A+</option><option>A-</option><option>B+</option><option>B-</option>
-                            <option>O+</option><option>O-</option><option>AB+</option><option>AB-</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Permanent Address</label>
-                        <textarea name="permanent_address" class="form-control" required></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Profession</label>
-                        <input type="text" name="profession" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Salary</label>
-                        <input type="number" name="salary" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" name="username" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" name="password" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Photo</label>
-                        <input type="file" name="photo" class="form-control" accept="image/*">
-                    </div>
-                </div>
-                
-                <button type="submit" name="add_employee" class="btn-submit">
-                    <i class="fas fa-save"></i> Add Employee
-                </button>
-            </form>
-        </div>
-    </div>
-
-    <!-- ==================== ADD HOD MODAL ==================== -->
-    <div id="addHODModal" class="modal-overlay">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-crown"></i> Add Department Head (HOD)</h2>
-                <div class="modal-close" onclick="closeModal('addHODModal')">&times;</div>
-            </div>
-            
-            <?php if(isset($hod_success)): ?>
-            <div class="alert-success">
-                <i class="fas fa-check-circle"></i> <?php echo $hod_success; ?>
+            <?php if(isset($_GET['success']) && $_GET['success'] == 'marks'): ?>
+            <div class="alert-modern success">
+                <i class="fas fa-check-circle"></i> Marks saved successfully!
             </div>
             <?php endif; ?>
 
-            <form method="POST" enctype="multipart/form-data">
+            <!-- Load Students Form - Shows when no students are loaded -->
+            <?php if(!$show_marks_students): ?>
+            <form method="POST">
                 <div class="form-grid">
-                    <div class="form-group">
-                        <label>HOD ID</label>
-                        <input type="text" name="hod_id" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" name="name" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="text" name="phone" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Department</label>
-                        <select name="department" class="form-control" required>
-                            <option value="">Select Department</option>
-                            <option value="AIML">AIML</option>
-                            <option value="CSE">CSE</option>
-                              <option value="IOT">IOT</option>
-                            <option value="ECE">ECE</option>
-                            <option value="MECH">MECH</option>
-                            <option value="CIVIL">CIVIL</option>
-                            <option value="EEE">EEE</option>
+                    <div class="input-group-modern">
+                        <label>Subject</label>
+                        <select name="subject_code" class="select-modern" required>
+                            <option value="">Select Subject</option>
+                            <?php
+                            $assigned_subjects->data_seek(0);
+                            while($sub = $assigned_subjects->fetch_assoc()):
+                            ?>
+                            <option value="<?php echo $sub['subject_code']; ?>">
+                                <?php echo $sub['subject_code']; ?> - <?php echo $sub['subject_name']; ?> (Sec <?php echo $sub['section']; ?>)
+                            </option>
+                            <?php endwhile; ?>
                         </select>
                     </div>
-                    
-                    <div class="form-group">
-                        <label>Qualification</label>
-                        <input type="text" name="qualification" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Experience (Years)</label>
-                        <input type="number" name="experience" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" name="username" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Password</label>
-                        <input type="password" name="password" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Photo</label>
-                        <input type="file" name="photo" class="form-control" accept="image/*">
-                    </div>
-                </div>
-                
-                <button type="submit" name="add_hod" class="btn-submit">
-                    <i class="fas fa-save"></i> Add HOD
-                </button>
-            </form>
-        </div>
-    </div>
 
-    <!-- ==================== VIEW STUDENT MODAL ==================== -->
-    <?php if($view_student): ?>
-    <div id="viewStudentModal" class="modal-overlay active">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-user-graduate"></i> Student Details</h2>
-                <div class="modal-close" onclick="closeModal('viewStudentModal'); window.location.href='dashboard.php'">&times;</div>
-            </div>
-            
-            <div class="profile-view">
-                <?php if(!empty($view_student['photo']) && file_exists("../uploads/".$view_student['photo'])): ?>
-                    <img src="../uploads/<?php echo $view_student['photo']; ?>" class="profile-view-img">
-                <?php else: ?>
-                    <div style="width:150px; height:150px; border-radius:50%; background:linear-gradient(135deg,#ffd93d,#ff6b6b); display:flex; align-items:center; justify-content:center; font-size:3rem; margin-bottom:1rem;">
-                        <?php echo strtoupper(substr($view_student['name'], 0, 2)); ?>
-                    </div>
-                <?php endif; ?>
-                <div class="profile-view-name"><?php echo $view_student['name']; ?></div>
-                <div class="profile-view-badge">Roll No: <?php echo $view_student['roll_no']; ?></div>
-            </div>
-
-            <div class="details-grid">
-                <div class="detail-item">
-                    <div class="detail-label">Date of Birth</div>
-                    <div class="detail-value"><?php echo date('d M Y', strtotime($view_student['dob'])); ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Email</div>
-                    <div class="detail-value"><?php echo $view_student['email']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Phone</div>
-                    <div class="detail-value"><?php echo $view_student['phone']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Course</div>
-                    <div class="detail-value"><?php echo $view_student['course']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Department</div>
-                    <div class="detail-value"><?php echo $view_student['department'] ?? 'N/A'; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Semester / Section</div>
-                    <div class="detail-value"><?php echo ($view_student['semester'] ?? 'N/A') . ' / ' . ($view_student['section'] ?? 'N/A'); ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">SSC Marks</div>
-                    <div class="detail-value"><?php echo $view_student['ssc_marks']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Polycet Rank</div>
-                    <div class="detail-value"><?php echo $view_student['polycet_rank']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Category</div>
-                    <div class="detail-value"><?php echo $view_student['category']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Father's Name</div>
-                    <div class="detail-value"><?php echo $view_student['father_name']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Mother's Name</div>
-                    <div class="detail-value"><?php echo $view_student['mother_name']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Blood Group</div>
-                    <div class="detail-value"><?php echo $view_student['blood_group']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Permanent Address</div>
-                    <div class="detail-value"><?php echo $view_student['permanent_address']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Local Address</div>
-                    <div class="detail-value"><?php echo $view_student['local_address']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Total Fee</div>
-                    <div class="detail-value">₹<?php echo number_format($view_student['total_fee']); ?></div>
-                </div>
-            </div>
-
-            <div style="display: flex; gap: 1rem; margin-top: 2rem;">
-                <button class="btn-submit" onclick="editStudent(<?php echo $view_student['id']; ?>)">
-                    <i class="fas fa-edit"></i> Edit Student
-                </button>
-                <button class="btn-submit" style="background: linear-gradient(135deg, #ff6b6b, #ff4757);" onclick="window.location.href='?delete_student=<?php echo $view_student['id']; ?>'">
-                    <i class="fas fa-trash"></i> Delete Student
-                </button>
-            </div>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <!-- ==================== VIEW EMPLOYEE MODAL ==================== -->
-    <?php if($view_employee): ?>
-    <div id="viewEmployeeModal" class="modal-overlay active">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-user-tie"></i> Employee Details</h2>
-                <div class="modal-close" onclick="closeModal('viewEmployeeModal'); window.location.href='dashboard.php'">&times;</div>
-            </div>
-            
-            <div class="profile-view">
-                <?php if(!empty($view_employee['photo']) && file_exists("../uploads/".$view_employee['photo'])): ?>
-                    <img src="../uploads/<?php echo $view_employee['photo']; ?>" class="profile-view-img">
-                <?php else: ?>
-                    <div style="width:150px; height:150px; border-radius:50%; background:linear-gradient(135deg,#ffd93d,#ff6b6b); display:flex; align-items:center; justify-content:center; font-size:3rem; margin-bottom:1rem;">
-                        <?php echo strtoupper(substr($view_employee['name'], 0, 2)); ?>
-                    </div>
-                <?php endif; ?>
-                <div class="profile-view-name"><?php echo $view_employee['name']; ?></div>
-                <div class="profile-view-badge"><?php echo $view_employee['profession']; ?></div>
-            </div>
-
-            <div class="details-grid">
-                <div class="detail-item">
-                    <div class="detail-label">Employee ID</div>
-                    <div class="detail-value"><?php echo $view_employee['emp_id']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Date of Birth</div>
-                    <div class="detail-value"><?php echo date('d M Y', strtotime($view_employee['dob'])); ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Department</div>
-                    <div class="detail-value"><?php echo $view_employee['department']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Phone</div>
-                    <div class="detail-value"><?php echo $view_employee['phone']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Email</div>
-                    <div class="detail-value"><?php echo $view_employee['email']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Category</div>
-                    <div class="detail-value"><?php echo $view_employee['category']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Father's Name</div>
-                    <div class="detail-value"><?php echo $view_employee['father_name']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Blood Group</div>
-                    <div class="detail-value"><?php echo $view_employee['blood_group']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Address</div>
-                    <div class="detail-value"><?php echo $view_employee['permanent_address']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Salary</div>
-                    <div class="detail-value">₹<?php echo number_format($view_employee['salary']); ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Username</div>
-                    <div class="detail-value"><?php echo $view_employee['username']; ?></div>
-                </div>
-            </div>
-
-            <div style="display: flex; gap: 1rem; margin-top: 2rem;">
-                <button class="btn-submit" onclick="editEmployee('<?php echo $view_employee['emp_id']; ?>')">
-                    <i class="fas fa-edit"></i> Edit Employee
-                </button>
-                <button class="btn-submit" style="background: linear-gradient(135deg, #ff6b6b, #ff4757);" onclick="window.location.href='?delete_employee=<?php echo $view_employee['emp_id']; ?>'">
-                    <i class="fas fa-trash"></i> Delete Employee
-                </button>
-            </div>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <!-- ==================== VIEW HOD MODAL ==================== -->
-    <?php if($view_hod): ?>
-    <div id="viewHODModal" class="modal-overlay active">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-crown"></i> HOD Details</h2>
-                <div class="modal-close" onclick="closeModal('viewHODModal'); window.location.href='dashboard.php'">&times;</div>
-            </div>
-            
-            <div class="profile-view">
-                <?php if(!empty($view_hod['photo']) && file_exists("../uploads/".$view_hod['photo'])): ?>
-                    <img src="../uploads/<?php echo $view_hod['photo']; ?>" class="profile-view-img">
-                <?php else: ?>
-                    <div style="width:150px; height:150px; border-radius:50%; background:linear-gradient(135deg,#ffd93d,#ff6b6b); display:flex; align-items:center; justify-content:center; font-size:3rem; margin-bottom:1rem;">
-                        <?php echo strtoupper(substr($view_hod['name'], 0, 2)); ?>
-                    </div>
-                <?php endif; ?>
-                <div class="profile-view-name"><?php echo $view_hod['name']; ?></div>
-                <div class="profile-view-badge">Head of <?php echo $view_hod['department']; ?> Department</div>
-            </div>
-
-            <div class="details-grid">
-                <div class="detail-item">
-                    <div class="detail-label">HOD ID</div>
-                    <div class="detail-value"><?php echo $view_hod['hod_id']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Email</div>
-                    <div class="detail-value"><?php echo $view_hod['email']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Phone</div>
-                    <div class="detail-value"><?php echo $view_hod['phone']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Qualification</div>
-                    <div class="detail-value"><?php echo $view_hod['qualification']; ?></div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Experience</div>
-                    <div class="detail-value"><?php echo $view_hod['experience']; ?> years</div>
-                </div>
-                <div class="detail-item">
-                    <div class="detail-label">Username</div>
-                    <div class="detail-value"><?php echo $view_hod['username']; ?></div>
-                </div>
-            </div>
-
-            <div style="display: flex; gap: 1rem; margin-top: 2rem;">
-                <button class="btn-submit" onclick="editHOD(<?php echo $view_hod['id']; ?>)">
-                    <i class="fas fa-edit"></i> Edit HOD
-                </button>
-                <button class="btn-submit" style="background: linear-gradient(135deg, #ff6b6b, #ff4757);" onclick="window.location.href='?delete_hod=<?php echo $view_hod['id']; ?>'">
-                    <i class="fas fa-trash"></i> Delete HOD
-                </button>
-            </div>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <!-- ==================== EDIT STUDENT MODAL ==================== -->
-    <?php if($edit_student): ?>
-    <div id="editStudentModal" class="modal-overlay active">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-edit"></i> Edit Student</h2>
-                <div class="modal-close" onclick="closeModal('editStudentModal'); window.location.href='dashboard.php'">&times;</div>
-            </div>
-
-            <form method="POST" enctype="multipart/form-data">
-                <input type="hidden" name="student_id" value="<?php echo $edit_student['id']; ?>">
-                <input type="hidden" name="old_photo" value="<?php echo $edit_student['photo']; ?>">
-                
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Roll Number</label>
-                        <input type="text" name="roll_no" value="<?php echo $edit_student['roll_no']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" name="name" value="<?php echo $edit_student['name']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Date of Birth</label>
-                        <input type="date" name="dob" value="<?php echo $edit_student['dob']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" value="<?php echo $edit_student['email']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="text" name="phone" value="<?php echo $edit_student['phone']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Course</label>
-                        <input type="text" name="course" value="<?php echo $edit_student['course']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Department</label>
-                        <select name="department" class="form-control" required>
-                            <option value="AIML" <?php echo ($edit_student['department'] == 'AIML') ? 'selected' : ''; ?>>AIML</option>
-                            <option value="CSE" <?php echo ($edit_student['department'] == 'CSE') ? 'selected' : ''; ?>>CSE</option>
-                               <option value="IOT" <?php echo ($edit_student['department'] == 'IOT') ? 'selected' : ''; ?>>IOT</option>
-                            <option value="ECE" <?php echo ($edit_student['department'] == 'ECE') ? 'selected' : ''; ?>>ECE</option>
-                            <option value="MECH" <?php echo ($edit_student['department'] == 'MECH') ? 'selected' : ''; ?>>MECH</option>
-                            <option value="CIVIL" <?php echo ($edit_student['department'] == 'CIVIL') ? 'selected' : ''; ?>>CIVIL</option>
-                            <option value="EEE" <?php echo ($edit_student['department'] == 'EEE') ? 'selected' : ''; ?>>EEE</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Semester</label>
-                        <select name="semester" class="form-control" required>
-                            <?php for($i=1; $i<=6; $i++): ?>
-                            <option value="<?php echo $i; ?>" <?php echo ($edit_student['semester'] == $i) ? 'selected' : ''; ?>>Semester <?php echo $i; ?></option>
-                            <?php endfor; ?>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
+                    <div class="input-group-modern">
                         <label>Section</label>
-                        <select name="section" class="form-control" required>
-                            <option value="1A" <?php echo ($edit_student['section'] == '1A') ? 'selected' : ''; ?>>Section 1A</option>
-                            <option value="1B" <?php echo ($edit_student['section'] == '1B') ? 'selected' : ''; ?>>Section 1B</option>
-                            <option value="1C" <?php echo ($edit_student['section'] == '1C') ? 'selected' : ''; ?>>Section 1C</option>
-                            <option value="1D" <?php echo ($edit_student['section'] == '1D') ? 'selected' : ''; ?>>Section 1D</option>
-                            
-                            <option value="2A" <?php echo ($edit_student['section'] == '2A') ? 'selected' : ''; ?>>Section 2A</option>
-                            <option value="2B" <?php echo ($edit_student['section'] == '2B') ? 'selected' : ''; ?>>Section 2B</option>
-                            <option value="2C" <?php echo ($edit_student['section'] == '2C') ? 'selected' : ''; ?>>Section 2C</option>
-                            <option value="2D" <?php echo ($edit_student['section'] == '2D') ? 'selected' : ''; ?>>Section 2D</option>
-                            
-                            <option value="3A" <?php echo ($edit_student['section'] == '3A') ? 'selected' : ''; ?>>Section 3A</option>
-                            <option value="3B" <?php echo ($edit_student['section'] == '3B') ? 'selected' : ''; ?>>Section 3B</option>
-                            <option value="3C" <?php echo ($edit_student['section'] == '3C') ? 'selected' : ''; ?>>Section 3C</option>
-                            <option value="3D" <?php echo ($edit_student['section'] == '3D') ? 'selected' : ''; ?>>Section 3D</option>
+                        <select name="section" class="select-modern" required>
+                            <option value="">Select Section</option>
+                            <?php
+                            $sections->data_seek(0);
+                            while($sec = $sections->fetch_assoc()):
+                            ?>
+                            <option value="<?php echo $sec['section']; ?>">Section <?php echo $sec['section']; ?></option>
+                            <?php endwhile; ?>
+                        </select>
+                    </div>
 
+                    <div class="input-group-modern">
+                        <label>Exam Type</label>
+                        <select name="exam_type" class="select-modern" required>
+                            <option value="">Select Exam</option>
+                            <option value="Mid1">Mid Term 1</option>
+                            <option value="Mid2">Mid Term 2</option>
+                            <option value="Mid3">Mid Term 3</option>
+                            <option value="Slip1">Slip Test 1</option>
+                            <option value="Slip2">Slip Test 2</option>
                         </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Total Fee</label>
-                        <input type="number" name="total_fee" value="<?php echo $edit_student['total_fee']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>SSC Marks</label>
-                        <input type="number" name="ssc_marks" value="<?php echo $edit_student['ssc_marks']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Polycet Rank</label>
-                        <input type="number" name="polycet_rank" value="<?php echo $edit_student['polycet_rank']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <select name="category" class="form-control" required>
-                            <option value="OC" <?php echo ($edit_student['category'] == 'OC') ? 'selected' : ''; ?>>OC</option>
-                            <option value="BC" <?php echo ($edit_student['category'] == 'BC') ? 'selected' : ''; ?>>BC</option>
-                            <option value="SC" <?php echo ($edit_student['category'] == 'SC') ? 'selected' : ''; ?>>SC</option>
-                            <option value="ST" <?php echo ($edit_student['category'] == 'ST') ? 'selected' : ''; ?>>ST</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Father's Name</label>
-                        <input type="text" name="father_name" value="<?php echo $edit_student['father_name']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Mother's Name</label>
-                        <input type="text" name="mother_name" value="<?php echo $edit_student['mother_name']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Blood Group</label>
-                        <select name="blood_group" class="form-control" required>
-                            <option value="A+" <?php echo ($edit_student['blood_group'] == 'A+') ? 'selected' : ''; ?>>A+</option>
-                            <option value="A-" <?php echo ($edit_student['blood_group'] == 'A-') ? 'selected' : ''; ?>>A-</option>
-                            <option value="B+" <?php echo ($edit_student['blood_group'] == 'B+') ? 'selected' : ''; ?>>B+</option>
-                            <option value="B-" <?php echo ($edit_student['blood_group'] == 'B-') ? 'selected' : ''; ?>>B-</option>
-                            <option value="O+" <?php echo ($edit_student['blood_group'] == 'O+') ? 'selected' : ''; ?>>O+</option>
-                            <option value="O-" <?php echo ($edit_student['blood_group'] == 'O-') ? 'selected' : ''; ?>>O-</option>
-                            <option value="AB+" <?php echo ($edit_student['blood_group'] == 'AB+') ? 'selected' : ''; ?>>AB+</option>
-                            <option value="AB-" <?php echo ($edit_student['blood_group'] == 'AB-') ? 'selected' : ''; ?>>AB-</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Permanent Address</label>
-                        <textarea name="permanent_address" class="form-control" required><?php echo $edit_student['permanent_address']; ?></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Local Address</label>
-                        <textarea name="local_address" class="form-control" required><?php echo $edit_student['local_address']; ?></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Change Photo</label>
-                        <input type="file" name="photo" class="form-control" accept="image/*">
-                        <?php if(!empty($edit_student['photo'])): ?>
-                        <small style="color:rgba(255,255,255,0.6);">Current photo: <?php echo $edit_student['photo']; ?></small>
-                        <?php endif; ?>
                     </div>
                 </div>
                 
-                <button type="submit" name="edit_student" class="btn-submit">
-                    <i class="fas fa-save"></i> Update Student
+                <button type="submit" name="load_marks_students" class="btn-modern">
+                    <i class="fas fa-users"></i> Load Students
                 </button>
             </form>
+            <?php endif; ?>
+
+            <!-- Student marks entry form - Shows when students are loaded -->
+            <?php if($show_marks_students): 
+                $marks_students_list = $conn->query("SELECT * FROM students WHERE department='$employee_department' AND section='{$_SESSION['marks_section']}' ORDER BY roll_no");
+            ?>
+            <form method="POST">
+                <input type="hidden" name="subject_code" value="<?php echo $_SESSION['marks_subject']; ?>">
+                <input type="hidden" name="section" value="<?php echo $_SESSION['marks_section']; ?>">
+                <input type="hidden" name="exam_type" value="<?php echo $_SESSION['marks_exam_type']; ?>">
+
+                <!-- Marks Distribution Info -->
+                <div class="marks-distribution">
+                    <div class="marks-badge primary">
+                        <i class="fas fa-pencil-alt"></i> Written: 40
+                    </div>
+                    <div class="marks-badge success">
+                        <i class="fas fa-tasks"></i> Assignment: 5
+                    </div>
+                    <div class="marks-badge warning">
+                        <i class="fas fa-user-check"></i> Dinamic: 5
+                    </div>
+                    <div class="marks-badge total">
+                        <i class="fas fa-calculator"></i> Total: 50
+                    </div>
+                </div>
+
+                <div style="max-height: 400px; overflow-y: auto; margin: 1.5rem 0;">
+                    <table class="modern-table">
+                        <thead>
+                            <tr>
+                                <th>Roll No</th>
+                                <th>Name</th>
+                                <th style="background: rgba(99, 102, 241, 0.2);">Written (40)</th>
+                                <th style="background: rgba(16, 185, 129, 0.2);">Assignment (5)</th>
+                                <th style="background: rgba(245, 158, 11, 0.2);">Dinamic (5)</th>
+                                <th style="background: rgba(99, 102, 241, 0.3);">Total (50)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php while($student = $marks_students_list->fetch_assoc()): 
+                                // Check if marks already exist
+                                $check = $conn->prepare("SELECT marks, assignment_marks, dinamic_marks FROM internal_marks 
+                                    WHERE student_id=? AND subject_code=? AND exam_type=?");
+                                $check->bind_param("iss", $student['id'], $_SESSION['marks_subject'], $_SESSION['marks_exam_type']);
+                                $check->execute();
+                                $check->bind_result($existing_marks, $existing_assignment, $existing_dinamic);
+                                $check->fetch();
+                                $check->close();
+                                
+                                // Calculate written marks from total
+                                $existing_written = $existing_marks - ($existing_assignment ?? 0) - ($existing_dinamic ?? 0);
+                                if($existing_written < 0) $existing_written = 0;
+                                
+                                $total = ($existing_marks ?? 0);
+                            ?>
+                            <tr>
+                                <td><?php echo $student['roll_no']; ?></td>
+                                <td><?php echo $student['name']; ?></td>
+                                <td>
+                                    <input type="number" 
+                                           name="written[<?php echo $student['id']; ?>]" 
+                                           class="marks-input-written" 
+                                           value="<?php echo $existing_written ?: ''; ?>" 
+                                           min="0" max="40" 
+                                           data-student="<?php echo $student['id']; ?>"
+                                           onchange="updateTotal(<?php echo $student['id']; ?>)"
+                                           onkeyup="updateTotal(<?php echo $student['id']; ?>)">
+                                </td>
+                                <td>
+                                    <input type="number" 
+                                           name="assignment[<?php echo $student['id']; ?>]" 
+                                           class="marks-input-assignment" 
+                                           value="<?php echo $existing_assignment ?: ''; ?>" 
+                                           min="0" max="5" 
+                                           data-student="<?php echo $student['id']; ?>"
+                                           onchange="updateTotal(<?php echo $student['id']; ?>)"
+                                           onkeyup="updateTotal(<?php echo $student['id']; ?>)">
+                                </td>
+                                <td>
+                                    <input type="number" 
+                                           name="dinamic[<?php echo $student['id']; ?>]" 
+                                           class="marks-input-dinamic" 
+                                           value="<?php echo $existing_dinamic ?: ''; ?>" 
+                                           min="0" max="5" 
+                                           data-student="<?php echo $student['id']; ?>"
+                                           onchange="updateTotal(<?php echo $student['id']; ?>)"
+                                           onkeyup="updateTotal(<?php echo $student['id']; ?>)">
+                                </td>
+                                <td>
+                                    <input type="number" 
+                                           id="total-<?php echo $student['id']; ?>" 
+                                           class="marks-total" 
+                                           value="<?php echo $total ?: ''; ?>" 
+                                           readonly>
+                                </td>
+                            </tr>
+                            <?php endwhile; ?>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div style="display: flex; gap: 1rem; justify-content: space-between; align-items: center;">
+                    <div style="color: rgba(255,255,255,0.6); font-size: 0.9rem;">
+                        <i class="fas fa-info-circle" style="color: var(--primary);"></i>
+                        Total is automatically calculated
+                    </div>
+                    <div style="display: flex; gap: 1rem;">
+                        <button type="button" class="btn-modern" style="width: auto; padding: 0.8rem 2rem;" onclick="calculateAllTotals()">
+                            <i class="fas fa-calculator"></i> Calculate All
+                        </button>
+                        <button type="submit" name="save_marks_components" class="btn-modern" style="width: auto; padding: 0.8rem 2rem;">
+                            <i class="fas fa-save"></i> Save Marks
+                        </button>
+                    </div>
+                </div>
+            </form>
+            <?php endif; ?>
         </div>
     </div>
-    <?php endif; ?>
 
-    <!-- ==================== EDIT EMPLOYEE MODAL ==================== -->
-    <?php if($edit_employee): ?>
-    <div id="editEmployeeModal" class="modal-overlay active">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-edit"></i> Edit Employee</h2>
-                <div class="modal-close" onclick="closeModal('editEmployeeModal'); window.location.href='dashboard.php'">&times;</div>
+    <!-- ==================== FEE COLLECTION MODAL ==================== -->
+    <div id="feeModal" class="modal-modern <?php echo isset($_SESSION['fee_student_id']) ? 'active' : ''; ?>">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-rupee-sign"></i> Collect Fee</h2>
+                <div class="modal-close-modern" onclick="closeModal('feeModal')">
+                    <i class="fas fa-times"></i>
+                </div>
             </div>
 
-            <form method="POST" enctype="multipart/form-data">
-                <input type="hidden" name="emp_id" value="<?php echo $edit_employee['emp_id']; ?>">
-                <input type="hidden" name="old_photo" value="<?php echo $edit_employee['photo']; ?>">
-                
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>Employee ID</label>
-                        <input type="text" value="<?php echo $edit_employee['emp_id']; ?>" class="form-control" disabled>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" name="name" value="<?php echo $edit_employee['name']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Date of Birth</label>
-                        <input type="date" name="dob" value="<?php echo $edit_employee['dob']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Department</label>
-                        <select name="department" class="form-control" required>
-                            <option value="AIML" <?php echo ($edit_employee['department'] == 'AIML') ? 'selected' : ''; ?>>AIML</option>
-                            <option value="CSE" <?php echo ($edit_employee['department'] == 'CSE') ? 'selected' : ''; ?>>CSE</option>
-                            <option value="IOT" <?php echo ($edit_student['department'] == 'IOT') ? 'selected' : ''; ?>>IOT</option>
-                            <option value="ECE" <?php echo ($edit_employee['department'] == 'ECE') ? 'selected' : ''; ?>>ECE</option>
-                            <option value="MECH" <?php echo ($edit_employee['department'] == 'MECH') ? 'selected' : ''; ?>>MECH</option>
-                            <option value="CIVIL" <?php echo ($edit_employee['department'] == 'CIVIL') ? 'selected' : ''; ?>>CIVIL</option>
-                            <option value="EEE" <?php echo ($edit_employee['department'] == 'EEE') ? 'selected' : ''; ?>>EEE</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="text" name="phone" value="<?php echo $edit_employee['phone']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Category</label>
-                        <input type="text" name="category" value="<?php echo $edit_employee['category']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Father's Name</label>
-                        <input type="text" name="father_name" value="<?php echo $edit_employee['father_name']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Blood Group</label>
-                        <select name="blood_group" class="form-control" required>
-                            <option value="A+" <?php echo ($edit_employee['blood_group'] == 'A+') ? 'selected' : ''; ?>>A+</option>
-                            <option value="A-" <?php echo ($edit_employee['blood_group'] == 'A-') ? 'selected' : ''; ?>>A-</option>
-                            <option value="B+" <?php echo ($edit_employee['blood_group'] == 'B+') ? 'selected' : ''; ?>>B+</option>
-                            <option value="B-" <?php echo ($edit_employee['blood_group'] == 'B-') ? 'selected' : ''; ?>>B-</option>
-                            <option value="O+" <?php echo ($edit_employee['blood_group'] == 'O+') ? 'selected' : ''; ?>>O+</option>
-                            <option value="O-" <?php echo ($edit_employee['blood_group'] == 'O-') ? 'selected' : ''; ?>>O-</option>
-                            <option value="AB+" <?php echo ($edit_employee['blood_group'] == 'AB+') ? 'selected' : ''; ?>>AB+</option>
-                            <option value="AB-" <?php echo ($edit_employee['blood_group'] == 'AB-') ? 'selected' : ''; ?>>AB-</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Permanent Address</label>
-                        <textarea name="permanent_address" class="form-control" required><?php echo $edit_employee['permanent_address']; ?></textarea>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Profession</label>
-                        <input type="text" name="profession" value="<?php echo $edit_employee['profession']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Salary</label>
-                        <input type="number" name="salary" value="<?php echo $edit_employee['salary']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" value="<?php echo $edit_employee['email']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" name="username" value="<?php echo $edit_employee['username']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Change Photo</label>
-                        <input type="file" name="photo" class="form-control" accept="image/*">
-                        <?php if(!empty($edit_employee['photo'])): ?>
-                        <small style="color:rgba(255,255,255,0.6);">Current photo: <?php echo $edit_employee['photo']; ?></small>
-                        <?php endif; ?>
-                    </div>
-                </div>
-                
-                <button type="submit" name="edit_employee" class="btn-submit">
-                    <i class="fas fa-save"></i> Update Employee
-                </button>
-            </form>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <!-- ==================== EDIT HOD MODAL ==================== -->
-    <?php if($edit_hod): ?>
-    <div id="editHODModal" class="modal-overlay active">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-edit"></i> Edit HOD</h2>
-                <div class="modal-close" onclick="closeModal('editHODModal'); window.location.href='dashboard.php'">&times;</div>
+            <?php if($fee_error): ?>
+            <div class="alert-modern error">
+                <i class="fas fa-exclamation-circle"></i> <?php echo $fee_error; ?>
             </div>
+            <?php endif; ?>
 
-            <form method="POST" enctype="multipart/form-data">
-                <input type="hidden" name="hod_id" value="<?php echo $edit_hod['id']; ?>">
-                <input type="hidden" name="old_photo" value="<?php echo $edit_hod['photo']; ?>">
+            <?php if($fee_success && $receipt_data): ?>
+            <!-- Receipt Display -->
+            <div class="receipt-card">
+                <div class="receipt-header">
+                    <h3>A.A.N.M.&.V.V.R.S.R. POLYTECHNIC</h3>
+                    <p style="color: #666;">Gudlavalleru - Fee Receipt</p>
+                    <h4 style="margin-top: 1rem; color: #333;">PAYMENT RECEIPT</h4>
+                </div>
                 
-                <div class="form-grid">
-                    <div class="form-group">
-                        <label>HOD ID</label>
-                        <input type="text" name="hod_id_code" value="<?php echo $edit_hod['hod_id']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Full Name</label>
-                        <input type="text" name="name" value="<?php echo $edit_hod['name']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Email</label>
-                        <input type="email" name="email" value="<?php echo $edit_hod['email']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Phone</label>
-                        <input type="text" name="phone" value="<?php echo $edit_hod['phone']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Department</label>
-                        <select name="department" class="form-control" required>
-                            <option value="AIML" <?php echo ($edit_hod['department'] == 'AIML') ? 'selected' : ''; ?>>AIML</option>
-                            <option value="CSE" <?php echo ($edit_hod['department'] == 'CSE') ? 'selected' : ''; ?>>CSE</option>
-                             <option value="IOT" <?php echo ($edit_student['department'] == 'IOT') ? 'selected' : ''; ?>>IOT</option>
-                            <option value="ECE" <?php echo ($edit_hod['department'] == 'ECE') ? 'selected' : ''; ?>>ECE</option>
-                            <option value="MECH" <?php echo ($edit_hod['department'] == 'MECH') ? 'selected' : ''; ?>>MECH</option>
-                            <option value="CIVIL" <?php echo ($edit_hod['department'] == 'CIVIL') ? 'selected' : ''; ?>>CIVIL</option>
-                            <option value="EEE" <?php echo ($edit_hod['department'] == 'EEE') ? 'selected' : ''; ?>>EEE</option>
-                        </select>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Qualification</label>
-                        <input type="text" name="qualification" value="<?php echo $edit_hod['qualification']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Experience (Years)</label>
-                        <input type="number" name="experience" value="<?php echo $edit_hod['experience']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Username</label>
-                        <input type="text" name="username" value="<?php echo $edit_hod['username']; ?>" class="form-control" required>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>Change Photo</label>
-                        <input type="file" name="photo" class="form-control" accept="image/*">
-                        <?php if(!empty($edit_hod['photo'])): ?>
-                        <small style="color:rgba(255,255,255,0.6);">Current photo: <?php echo $edit_hod['photo']; ?></small>
-                        <?php endif; ?>
+                <div style="border-top: 2px dashed var(--primary); border-bottom: 2px dashed var(--primary); padding: 1.5rem 0;">
+                    <div class="receipt-details">
+                        <div><strong>Receipt No:</strong> <?php echo $receipt_data['receipt_no']; ?></div>
+                        <div><strong>Date:</strong> <?php echo $receipt_data['date']; ?></div>
+                        <div><strong>Student Name:</strong> <?php echo $receipt_data['student_name']; ?></div>
+                        <div><strong>Student ID:</strong> <?php echo $receipt_data['student_id']; ?></div>
+                        <div><strong>Previous Balance:</strong> ₹<?php echo number_format($receipt_data['old_balance']); ?></div>
+                        <div><strong>Amount Paid:</strong> ₹<?php echo number_format($receipt_data['amount']); ?></div>
+                        <div style="grid-column: span 2;"><strong>Remaining Balance:</strong> ₹<?php echo number_format($receipt_data['new_balance']); ?></div>
                     </div>
                 </div>
                 
-                <button type="submit" name="edit_hod" class="btn-submit">
-                    <i class="fas fa-save"></i> Update HOD
-                </button>
-            </form>
-        </div>
-    </div>
-    <?php endif; ?>
-
-    <!-- ==================== FEE STATUS MODAL ==================== -->
-    <div id="feeStatusModal" class="modal-overlay">
-        <div class="modal-container">
-            <div class="modal-header">
-                <h2><i class="fas fa-chart-pie"></i> Fee Status Report</h2>
-                <div class="modal-close" onclick="closeModal('feeStatusModal')">&times;</div>
+                <div class="receipt-footer">
+                    <p>Authorized Signatory</p>
+                    <p style="margin-top: 1rem;">_________________________</p>
+                </div>
+                
+                <div style="display: flex; gap: 1rem; margin-top: 2rem;">
+                    <button onclick="window.print()" class="btn-modern" style="background: linear-gradient(135deg, #64748b, #475569);">
+                        <i class="fas fa-print"></i> Print Receipt
+                    </button>
+                    <button onclick="window.location.href='<?php echo $_SERVER['PHP_SELF']; ?>'" class="btn-modern">
+                        <i class="fas fa-check"></i> Done
+                    </button>
+                </div>
             </div>
             
-            <div style="margin-bottom: 2rem;">
-                <div style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap;">
-                    <button class="tab-btn active" onclick="filterFee('all')">All</button>
-                    <button class="tab-btn" onclick="filterFee('paid')">Paid</button>
-                    <button class="tab-btn" onclick="filterFee('pending')">Pending</button>
-                    <button class="tab-btn" onclick="filterFee('partial')">Partial</button>
+            <?php elseif(isset($_SESSION['fee_student_id']) && $selected_student): 
+                // Calculate balance
+                $paid_query = $conn->query("SELECT SUM(amount) as total_paid FROM payments WHERE student_id='{$_SESSION['fee_student_id']}'");
+                $paid_data = $paid_query->fetch_assoc();
+                $total_paid = $paid_data['total_paid'] ?? 0;
+                $old_balance = $selected_student['total_fee'] - $total_paid;
+            ?>
+            
+            <!-- Student Info and Fee Collection Form -->
+            <div class="balance-info">
+                <div>
+                    <div class="balance-label">Student</div>
+                    <div style="font-size: 1.3rem; font-weight: 600;"><?php echo $selected_student['name']; ?></div>
+                    <div style="opacity: 0.7;">Roll No: <?php echo $selected_student['roll_no']; ?></div>
+                </div>
+                <div style="text-align: right;">
+                    <div class="balance-label">Remaining Fee</div>
+                    <div class="balance-amount">₹<?php echo number_format($old_balance); ?></div>
+                </div>
+            </div>
+            
+            <div style="background: rgba(255,255,255,0.03); border-radius: 16px; padding: 1.5rem; margin-bottom: 1.5rem;">
+                <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem;">
+                    <span>Total Fee:</span>
+                    <span>₹<?php echo number_format($selected_student['total_fee']); ?></span>
+                </div>
+                <div style="display: flex; justify-content: space-between; margin-bottom: 0.5rem; color: var(--success);">
+                    <span>Total Paid:</span>
+                    <span>₹<?php echo number_format($total_paid); ?></span>
+                </div>
+                <div style="display: flex; justify-content: space-between; font-weight: 700; font-size: 1.1rem; margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid rgba(255,255,255,0.1);">
+                    <span>Due Amount:</span>
+                    <span style="color: <?php echo $old_balance > 0 ? 'var(--warning)' : 'var(--success)'; ?>;">₹<?php echo number_format($old_balance); ?></span>
                 </div>
             </div>
 
-            <div class="table-responsive">
-                <table class="modern-table" id="feeStatusTable">
+            <form method="POST">
+                <input type="hidden" name="student_id" value="<?php echo $_SESSION['fee_student_id']; ?>">
+                
+                <div class="input-group-modern">
+                    <label>Enter Amount to Collect (Max: ₹<?php echo number_format($old_balance); ?>)</label>
+                    <input type="number" name="amount" class="input-modern" required min="1" max="<?php echo $old_balance; ?>" step="1" placeholder="Enter amount">
+                </div>
+                
+                <div style="display: flex; gap: 1rem;">
+                    <button type="submit" name="collect_fee" class="btn-modern btn-success">
+                        <i class="fas fa-rupee-sign"></i> Collect Fee
+                    </button>
+                    <a href="?cancel_fee=1" class="btn-modern btn-outline">
+                        <i class="fas fa-times"></i> Cancel
+                    </a>
+                </div>
+            </form>
+            
+            <?php else: ?>
+            
+            <!-- Student Selection Form -->
+            <div class="fee-student-selector">
+                <input type="text" id="studentSearch" class="student-search" placeholder="Search by name or roll number...">
+                
+                <form method="POST">
+                    <div class="student-list">
+                        <?php 
+                        $students_list_fee->data_seek(0);
+                        while($student = $students_list_fee->fetch_assoc()): 
+                            $paid_query = $conn->query("SELECT SUM(amount) as total_paid FROM payments WHERE student_id='{$student['id']}'");
+                            $paid_data = $paid_query->fetch_assoc();
+                            $total_paid = $paid_data['total_paid'] ?? 0;
+                            $due = $student['total_fee'] - $total_paid;
+                        ?>
+                        <div class="student-item" onclick="selectStudent(<?php echo $student['id']; ?>)">
+                            <div class="student-info">
+                                <h4><?php echo $student['name']; ?></h4>
+                                <p>Roll No: <?php echo $student['roll_no']; ?> | <?php echo $student['course']; ?></p>
+                            </div>
+                            <div class="student-fee">
+                                <div class="total">₹<?php echo number_format($student['total_fee']); ?></div>
+                                <div class="paid">Due: ₹<?php echo number_format($due); ?></div>
+                            </div>
+                            <input type="radio" name="student_id" id="student_<?php echo $student['id']; ?>" value="<?php echo $student['id']; ?>" style="display: none;">
+                        </div>
+                        <?php endwhile; ?>
+                    </div>
+                    
+                    <button type="submit" name="load_fee_student" class="btn-modern" style="margin-top: 1rem;" id="selectStudentBtn" disabled>
+                        <i class="fas fa-arrow-right"></i> Continue to Payment
+                    </button>
+                </form>
+            </div>
+            
+            <script>
+                let selectedStudentId = null;
+                
+                function selectStudent(id) {
+                    // Remove selected class from all
+                    document.querySelectorAll('.student-item').forEach(item => {
+                        item.classList.remove('selected');
+                    });
+                    
+                    // Add selected class to clicked
+                    event.currentTarget.classList.add('selected');
+                    
+                    // Check the radio
+                    document.getElementById('student_' + id).checked = true;
+                    selectedStudentId = id;
+                    
+                    // Enable the button
+                    document.getElementById('selectStudentBtn').disabled = false;
+                }
+                
+                // Search functionality
+                document.getElementById('studentSearch').addEventListener('keyup', function() {
+                    let filter = this.value.toLowerCase();
+                    let items = document.querySelectorAll('.student-item');
+                    
+                    items.forEach(item => {
+                        let text = item.innerText.toLowerCase();
+                        if(text.includes(filter)) {
+                            item.style.display = 'flex';
+                        } else {
+                            item.style.display = 'none';
+                        }
+                    });
+                });
+            </script>
+            
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- ==================== VIEW ATTENDANCE MODAL ==================== -->
+    <div id="viewAttendanceModal" class="modal-modern">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-eye"></i> Attendance Report</h2>
+                <div class="modal-close-modern" onclick="closeModal('viewAttendanceModal')">
+                    <i class="fas fa-times"></i>
+                </div>
+            </div>
+
+            <div style="max-height: 500px; overflow-y: auto;">
+                <table class="modern-table">
                     <thead>
                         <tr>
-                            <th>Name</th>
                             <th>Roll No</th>
-                            <th>Department</th>
-                            <th>Total Fee</th>
-                            <th>Paid</th>
-                            <th>Remaining</th>
-                            <th>Status</th>
+                            <th>Name</th>
+                            <th>Section</th>
+                            <th>Total</th>
+                            <th>Present</th>
+                            <th>Absent</th>
+                            <th>%</th>
                         </tr>
                     </thead>
                     <tbody>
-                        <?php
-                        $fee_students = $conn->query("SELECT * FROM students ORDER BY name");
-                        while($student = $fee_students->fetch_assoc()):
-                            $paid_data = $conn->query("SELECT SUM(amount) as total_paid FROM payments WHERE student_id='{$student['id']}'")->fetch_assoc();
-                            $total_paid = $paid_data['total_paid'] ?? 0;
-                            $remaining = $student['total_fee'] - $total_paid;
-                            
-                            if($total_paid == 0){
-                                $status = "Pending";
-                                $status_class = "fee-pending";
-                            } elseif($remaining == 0){
-                                $status = "Paid";
-                                $status_class = "fee-paid";
-                            } else {
-                                $status = "Partial";
-                                $status_class = "fee-partial";
-                            }
+                        <?php 
+                        $attendance_report->data_seek(0);
+                        while($row = $attendance_report->fetch_assoc()): 
+                            $percentage = $row['total_classes'] > 0 ? round(($row['total_present'] / $row['total_classes']) * 100, 2) : 0;
+                            $badge_class = $percentage >= 75 ? 'badge-success' : ($percentage >= 50 ? 'badge-warning' : 'badge-danger');
                         ?>
-                        <tr data-status="<?php echo strtolower($status); ?>">
-                            <td><?php echo htmlspecialchars($student['name']); ?></td>
-                            <td><?php echo htmlspecialchars($student['roll_no']); ?></td>
-                            <td><?php echo htmlspecialchars($student['department'] ?? $student['course']); ?></td>
-                            <td>₹<?php echo number_format($student['total_fee']); ?></td>
-                            <td>₹<?php echo number_format($total_paid); ?></td>
-                            <td>₹<?php echo number_format($remaining); ?></td>
-                            <td><span class="<?php echo $status_class; ?>" style="padding:0.3rem 0.8rem; border-radius:50px;"><?php echo $status; ?></span></td>
+                        <tr>
+                            <td><?php echo $row['roll_no']; ?></td>
+                            <td><?php echo $row['name']; ?></td>
+                            <td><?php echo $row['section']; ?></td>
+                            <td><?php echo $row['total_classes'] ?: 0; ?></td>
+                            <td style="color: #10b981;"><?php echo $row['total_present'] ?: 0; ?></td>
+                            <td style="color: #ef4444;"><?php echo $row['total_absent'] ?: 0; ?></td>
+                            <td>
+                                <span class="badge-modern <?php echo $badge_class; ?>">
+                                    <?php echo $percentage; ?>%
+                                </span>
+                            </td>
                         </tr>
                         <?php endwhile; ?>
                     </tbody>
                 </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== MONTHLY REPORT MODAL ==================== -->
+    <div id="monthlyReportModal" class="modal-modern">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-chart-line"></i> Monthly Report - <?php echo date('F Y'); ?></h2>
+                <div class="modal-close-modern" onclick="closeModal('monthlyReportModal')">
+                    <i class="fas fa-times"></i>
+                </div>
+            </div>
+
+            <div style="max-height: 500px; overflow-y: auto;">
+                <table class="modern-table">
+                    <thead>
+                        <tr>
+                            <th>Roll No</th>
+                            <th>Name</th>
+                            <th>Section</th>
+                            <th>Classes</th>
+                            <th>Present</th>
+                            <th>Progress</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php 
+                        $monthly_report->data_seek(0);
+                        while($row = $monthly_report->fetch_assoc()): 
+                            $percentage = $row['total_classes'] > 0 ? round(($row['total_present'] / $row['total_classes']) * 100, 2) : 0;
+                        ?>
+                        <tr>
+                            <td><?php echo $row['roll_no']; ?></td>
+                            <td><?php echo $row['name']; ?></td>
+                            <td><?php echo $row['section']; ?></td>
+                            <td><?php echo $row['total_classes'] ?: 0; ?></td>
+                            <td><?php echo $row['total_present'] ?: 0; ?></td>
+                            <td style="width: 200px;">
+                                <div style="display: flex; align-items: center; gap: 0.5rem;">
+                                    <div class="progress-modern">
+                                        <div class="progress-fill" style="width: <?php echo $percentage; ?>%;"></div>
+                                    </div>
+                                    <span style="font-size: 0.85rem; color: white;"><?php echo $percentage; ?>%</span>
+                                </div>
+                            </td>
+                        </tr>
+                        <?php endwhile; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== TIMETABLE MODAL ==================== -->
+    <div id="timetableModal" class="modal-modern">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-calendar-alt"></i> My Weekly Timetable</h2>
+                <div class="modal-close-modern" onclick="closeModal('timetableModal')">
+                    <i class="fas fa-times"></i>
+                </div>
+            </div>
+
+            <div class="timetable-grid">
+                <?php
+                $days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+                foreach($days as $day):
+                    $day_periods = [];
+                    $employee_timetable->data_seek(0);
+                    while($period = $employee_timetable->fetch_assoc()) {
+                        if($period['day_of_week'] == $day) {
+                            $day_periods[] = $period;
+                        }
+                    }
+                ?>
+                <div class="timetable-day">
+                    <h4><?php echo $day; ?></h4>
+                    <?php if(!empty($day_periods)): ?>
+                        <?php foreach($day_periods as $period): ?>
+                        <div class="timetable-period">
+                            <strong>Period <?php echo $period['period']; ?></strong><br>
+                            <?php echo htmlspecialchars($period['subject_code']); ?><br>
+                            <?php echo htmlspecialchars($period['subject_name']); ?><br>
+                            <small>Sec <?php echo htmlspecialchars($period['section']); ?></small>
+                        </div>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <div style="opacity: 0.3; text-align: center; padding: 1rem;">
+                            <small>No classes</small>
+                        </div>
+                    <?php endif; ?>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
+    </div>
+
+    <!-- ==================== SUBJECTS MODAL ==================== -->
+    <div id="subjectsModal" class="modal-modern">
+        <div class="modal-content-modern">
+            <div class="modal-header-modern">
+                <h2><i class="fas fa-book-open"></i> My Assigned Subjects</h2>
+                <div class="modal-close-modern" onclick="closeModal('subjectsModal')">
+                    <i class="fas fa-times"></i>
+                </div>
+            </div>
+
+            <div class="subject-grid">
+                <?php
+                $assigned_subjects->data_seek(0);
+                while($subject = $assigned_subjects->fetch_assoc()):
+                ?>
+                <div class="subject-card">
+                    <div class="subject-code"><?php echo htmlspecialchars($subject['subject_code']); ?></div>
+                    <div class="subject-name"><?php echo htmlspecialchars($subject['subject_name']); ?></div>
+                    <div class="subject-meta">
+                        <span><i class="fas fa-layer-group"></i> Sem <?php echo $subject['semester']; ?></span>
+                        <span><i class="fas fa-users"></i> Sec <?php echo $subject['section']; ?></span>
+                    </div>
+                </div>
+                <?php endwhile; ?>
             </div>
         </div>
     </div>
 
     <script>
+        // Create floating particles
+        function createParticles() {
+            const container = document.getElementById('particles-container');
+            for (let i = 0; i < 20; i++) {
+                const particle = document.createElement('div');
+                particle.className = 'particle';
+                particle.style.width = Math.random() * 10 + 5 + 'px';
+                particle.style.height = particle.style.width;
+                particle.style.left = Math.random() * 100 + '%';
+                particle.style.animationDelay = Math.random() * 10 + 's';
+                particle.style.animationDuration = Math.random() * 10 + 15 + 's';
+                container.appendChild(particle);
+            }
+        }
+
+        // Function to update total for a specific student
+        function updateTotal(studentId) {
+            const written = parseFloat(document.querySelector(`input[name="written[${studentId}]"]`).value) || 0;
+            const assignment = parseFloat(document.querySelector(`input[name="assignment[${studentId}]"]`).value) || 0;
+            const dinamic = parseFloat(document.querySelector(`input[name="dinamic[${studentId}]"]`).value) || 0;
+            
+            const total = written + assignment + dinamic;
+            const totalField = document.getElementById(`total-${studentId}`);
+            if(totalField) totalField.value = total;
+            
+            // Validate max limits
+            if (written > 40) {
+                alert('Written marks cannot exceed 40');
+                document.querySelector(`input[name="written[${studentId}]"]`).value = 40;
+                updateTotal(studentId);
+            }
+            if (assignment > 5) {
+                alert('Assignment marks cannot exceed 5');
+                document.querySelector(`input[name="assignment[${studentId}]"]`).value = 5;
+                updateTotal(studentId);
+            }
+            if (dinamic > 5) {
+                alert('Dinamic marks cannot exceed 5');
+                document.querySelector(`input[name="dinamic[${studentId}]"]`).value = 5;
+                updateTotal(studentId);
+            }
+            if (total > 50) {
+                alert('Total marks cannot exceed 50');
+                document.querySelector(`input[name="written[${studentId}]"]`).value = 40;
+                document.querySelector(`input[name="assignment[${studentId}]"]`).value = 5;
+                document.querySelector(`input[name="dinamic[${studentId}]"]`).value = 5;
+                updateTotal(studentId);
+            }
+        }
+
+        // Function to calculate totals for all students
+        function calculateAllTotals() {
+            const writtenInputs = document.querySelectorAll('.marks-input-written');
+            writtenInputs.forEach(input => {
+                const studentId = input.getAttribute('data-student');
+                if(studentId) updateTotal(studentId);
+            });
+        }
+
         // Modal Functions
         function openModal(modalId) {
             document.getElementById(modalId).classList.add('active');
@@ -2499,132 +2661,97 @@ if(isset($_GET['view_hod_id'])){
         function closeModal(modalId) {
             document.getElementById(modalId).classList.remove('active');
             document.body.style.overflow = 'auto';
+            
+            // If closing marks modal and it's showing students, redirect to clear session
+            if(modalId === 'marksModal' && <?php echo $show_marks_students ? 'true' : 'false'; ?>) {
+                window.location.href = window.location.pathname;
+            }
+            
+            // If closing attendance modal and it's showing students, redirect to clear session
+            if(modalId === 'attendanceModal' && <?php echo $show_students ? 'true' : 'false'; ?>) {
+                window.location.href = window.location.pathname;
+            }
+            
+            // If closing fee modal and a student is selected, redirect to clear session
+            if(modalId === 'feeModal' && <?php echo isset($_SESSION['fee_student_id']) ? 'true' : 'false'; ?>) {
+                window.location.href = window.location.pathname + '?cancel_fee=1';
+            }
         }
 
-        // Tab Switching
-        function switchTab(tabName) {
-            // Update tab buttons
-            document.querySelectorAll('.tab-btn').forEach(btn => {
-                btn.classList.remove('active');
-            });
-            event.target.classList.add('active');
-            
-            // Show corresponding section
-            document.querySelectorAll('.table-section').forEach(section => {
-                section.classList.remove('active');
-            });
-            document.getElementById(tabName + '-section').classList.add('active');
-        }
-
-        // Fee Status Filter
-        function filterFee(status) {
-            const rows = document.querySelectorAll('#feeStatusTable tbody tr');
-            rows.forEach(row => {
-                if(status === 'all' || row.dataset.status === status) {
-                    row.style.display = '';
-                } else {
-                    row.style.display = 'none';
-                }
-            });
-            
-            // Update active filter button
-            document.querySelectorAll('#feeStatusModal .tab-btn').forEach(btn => {
-                btn.classList.remove('active');
-            });
-            event.target.classList.add('active');
-        }
-
-        // Global Search
-        document.getElementById('globalSearch').addEventListener('keyup', function() {
-            let filter = this.value.toLowerCase();
-            
-            // Search in students table
-            searchTable('studentsTable', filter);
-            // Search in employees table
-            searchTable('employeesTable', filter);
-            // Search in hods table
-            searchTable('hodsTable', filter);
+        // Close modal with Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                document.querySelectorAll('.modal-modern.active').forEach(modal => {
+                    modal.classList.remove('active');
+                    
+                    // If closing marks modal and it's showing students, redirect to clear session
+                    if(modal.id === 'marksModal' && <?php echo $show_marks_students ? 'true' : 'false'; ?>) {
+                        window.location.href = window.location.pathname;
+                    }
+                    
+                    // If closing attendance modal and it's showing students, redirect to clear session
+                    if(modal.id === 'attendanceModal' && <?php echo $show_students ? 'true' : 'false'; ?>) {
+                        window.location.href = window.location.pathname;
+                    }
+                    
+                    // If closing fee modal and a student is selected, redirect to clear session
+                    if(modal.id === 'feeModal' && <?php echo isset($_SESSION['fee_student_id']) ? 'true' : 'false'; ?>) {
+                        window.location.href = window.location.pathname + '?cancel_fee=1';
+                    }
+                });
+                document.body.style.overflow = 'auto';
+            }
         });
-
-        function searchTable(tableId, filter) {
-            const table = document.getElementById(tableId);
-            if(!table) return;
-            
-            const rows = table.querySelectorAll('tbody tr');
-            rows.forEach(row => {
-                const text = row.innerText.toLowerCase();
-                row.style.display = text.includes(filter) ? '' : 'none';
-            });
-        }
-
-        // View Functions
-        function viewStudent(id) {
-            window.location.href = '?view_student_id=' + id;
-        }
-
-        function editStudent(id) {
-            window.location.href = '?edit_student_id=' + id;
-        }
-
-        function viewEmployee(id) {
-            window.location.href = '?view_employee_id=' + id;
-        }
-
-        function editEmployee(id) {
-            window.location.href = '?edit_employee_id=' + id;
-        }
-
-        function viewHOD(id) {
-            window.location.href = '?view_hod_id=' + id;
-        }
-
-        function editHOD(id) {
-            window.location.href = '?edit_hod_id=' + id;
-        }
 
         // Close modal when clicking outside
         window.onclick = function(event) {
-            if (event.target.classList.contains('modal-overlay')) {
+            if (event.target.classList.contains('modal-modern')) {
                 event.target.classList.remove('active');
+                
+                // If closing marks modal and it's showing students, redirect to clear session
+                if(event.target.id === 'marksModal' && <?php echo $show_marks_students ? 'true' : 'false'; ?>) {
+                    window.location.href = window.location.pathname;
+                }
+                
+                // If closing attendance modal and it's showing students, redirect to clear session
+                if(event.target.id === 'attendanceModal' && <?php echo $show_students ? 'true' : 'false'; ?>) {
+                    window.location.href = window.location.pathname;
+                }
+                
+                // If closing fee modal and a student is selected, redirect to clear session
+                if(event.target.id === 'feeModal' && <?php echo isset($_SESSION['fee_student_id']) ? 'true' : 'false'; ?>) {
+                    window.location.href = window.location.pathname + '?cancel_fee=1';
+                }
                 document.body.style.overflow = 'auto';
-                window.location.href = 'dashboard.php';
             }
         }
 
-        // Keyboard shortcut (ESC to close)
-        document.addEventListener('keydown', function(e) {
-            if (e.key === 'Escape') {
-                document.querySelectorAll('.modal-overlay.active').forEach(modal => {
-                    modal.classList.remove('active');
-                });
-                document.body.style.overflow = 'auto';
-                window.location.href = 'dashboard.php';
+        // Theme toggle
+        function toggleTheme() {
+            document.body.classList.toggle('light-theme');
+            const icon = document.querySelector('.theme-toggle i');
+            if (icon.classList.contains('fa-moon')) {
+                icon.classList.remove('fa-moon');
+                icon.classList.add('fa-sun');
+            } else {
+                icon.classList.remove('fa-sun');
+                icon.classList.add('fa-moon');
             }
+        }
+
+        // Initialize
+        window.addEventListener('load', function() {
+            createParticles();
         });
 
-        // Smooth scroll
-        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
-            anchor.addEventListener('click', function(e) {
-                e.preventDefault();
-                document.querySelector(this.getAttribute('href')).scrollIntoView({
-                    behavior: 'smooth'
-                });
+        // Auto-hide alerts
+        setTimeout(() => {
+            document.querySelectorAll('.alert-modern').forEach(alert => {
+                alert.style.opacity = '0';
+                alert.style.transition = 'opacity 0.5s';
+                setTimeout(() => alert.remove(), 500);
             });
-        });
-
-        // Animation for stats cards
-        const observer = new IntersectionObserver((entries) => {
-            entries.forEach(entry => {
-                if (entry.isIntersecting) {
-                    entry.target.style.opacity = '1';
-                    entry.target.style.transform = 'translateY(0)';
-                }
-            });
-        });
-
-        document.querySelectorAll('.stat-card').forEach(card => {
-            observer.observe(card);
-        });
+        }, 5000);
     </script>
 </body>
 <!-- Footer with Developer Info -->
